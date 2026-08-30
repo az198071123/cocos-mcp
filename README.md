@@ -6,6 +6,8 @@ log, and look at a screenshot of what it just did.
 
 Eleven tools. Zero dependencies. No build step. Tested against Cocos Creator 3.8.8.
 
+If you landed here because the editor silently did nothing, go straight to [Gotchas](#gotchas) — that section is the real content.
+
 ## Why eleven tools and not a hundred
 
 The editor API is huge — `scene` alone declares 200+ messages. Wrapping each one as its own MCP tool means
@@ -70,7 +72,24 @@ means the tool names (`mcp__cocos-creator__*`) stay stable wherever you are:
 
 ## Gotchas
 
-Each of these cost real debugging time. They are why this README exists.
+Every bug found while building this had the same shape. The editor rarely throws — it returns something
+that looks like success, and you find out later. Half of these are Cocos's behaviour, half are mistakes
+this extension made itself while working around the first half.
+
+| What you see | What actually happened |
+| --- | --- |
+| `undefined` from `execute-scene-script` | the scene script exported its functions at the top level instead of under `methods` |
+| `SUCCESS (queued)` | a build is already running; yours is waiting behind it |
+| `SUCCESS (queued)`, then a failed task | the platform was invalid — nothing says which option, and `detailMessage` is empty |
+| `free: true` | a build is actively processing |
+| `bytes: 960` on a folder | the directory inode, not the 62 KB inside it *(our bug)* |
+| a blank line from a log | the file ended with a newline *(our bug)* |
+| a green test run | `listen()` lost the port and every assertion ran against a live editor *(our bug)* |
+| a missing `.port` file | the test suite deleted it in a `finally` block *(our bug)* |
+| `no match` from `editor_api` | it was only searching a quarter of the API *(our bug)* |
+
+The practical consequence: **read every "it worked" twice**, and when adding a tool here, ask what its
+failure looks like before asking what its success returns. The details behind each row follow.
 
 **A scene script must export `methods`.** Exporting the functions at the top level makes
 `execute-scene-script` return `undefined` — silently, with no error, even though the extension is enabled
