@@ -39,6 +39,18 @@ global.Editor = {
                 };
             }
             if (pkg === 'builder' && method === 'add-task') { addTaskArgs = args; return args[1] ? 36 : 1; }
+            if (pkg === 'asset-db' && method === 'query-asset-info') {
+                const t = args[0];
+                if (t === 'db://assets/x.png' || t === 'U-IMG') {
+                    return { source: 'db://assets/x.png', uuid: 'U-IMG', importer: 'image', file: __filename };
+                }
+                if (t === 'U-A') return { source: 'db://assets/common/a.prefab', uuid: 'U-A', importer: 'prefab' };
+                if (t === 'U-B') return { source: 'db://assets/op6/b.prefab', uuid: 'U-B', importer: 'prefab' };
+                return null; // U-GHOST: in the index, not in this checkout
+            }
+            if (pkg === 'asset-db' && method === 'query-asset-users') return ['U-A', 'U-B', 'U-GHOST', 'U-GHOST2'];
+            if (pkg === 'asset-db' && method === 'query-asset-dependencies') return ['D1', 'D2'];
+            if (pkg === 'asset-db' && method === 'query-asset-meta') return { subMetas: { f9941: { importer: 'sprite-frame' }, '6c48a': { importer: 'texture' } } };
             if (pkg === 'preview' && method === 'query-preview-url') return 'http://127.0.0.1:7456';
             if (pkg === 'preview' && method === 'get-preview-ip') return '127.0.0.1';
             if (pkg === 'preview' && method === 'query-connect-num') return 0;
@@ -81,7 +93,7 @@ async function assertPortFree() {
     assert.equal(notif.status, 202, 'notification must get 202, no body');
 
     const list = await (await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).json();
-    assert.equal(list.result.tools.length, 10);
+    assert.equal(list.result.tools.length, 11);
 
     const req = await (await post({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'editor_request', arguments: { pkg: 'scene', method: 'query-node-tree' } } })).json();
     assert.match(req.result.content[0].text, /query-node-tree/);
@@ -141,6 +153,19 @@ async function assertPortFree() {
     // initialize must advertise resources, or clients never ask for them
     assert.deepEqual(init.result.capabilities, { tools: {}, resources: {} });
 
+    // asset_info must resolve real users, count ghosts separately, and group by folder
+    const ai = await (await post({ jsonrpc: '2.0', id: 21, method: 'tools/call', params: { name: 'asset_info', arguments: { target: 'db://assets/x.png' } } })).json();
+    const aij = JSON.parse(ai.result.content[0].text);
+    assert.equal(aij.userCount, 2, 'ghosts must not inflate userCount');
+    assert.equal(aij.ghostUsers, 2, 'unresolvable users must be reported, not dropped');
+    assert.deepEqual(aij.usersByFolder, { common: 1, op6: 1 });
+    assert.deepEqual(aij.subAssets, ['U-IMG@f9941 (sprite-frame)', 'U-IMG@6c48a (texture)']);
+    assert.equal(aij.dependencies, 2);
+    assert.ok(aij.bytes > 0, 'bytes should come from the file on disk');
+
+    const miss = await (await post({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'asset_info', arguments: { target: 'db://nope' } } })).json();
+    assert.equal(miss.result.isError, true, 'a missing asset must surface as an error');
+
     // reload must reply BEFORE tearing the server down, then disable/enable this very directory
     const rel = await (await post({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'reload', arguments: {} } })).json();
     assert.match(rel.result.content[0].text, /reload scheduled/);
@@ -155,7 +180,7 @@ async function assertPortFree() {
     ext.load();
     await new Promise((r) => setTimeout(r, 200));
     const again = await (await post({ jsonrpc: '2.0', id: 9, method: 'tools/list' })).json();
-    assert.equal(again.result.tools.length, 10, 'reload leaked the port');
+    assert.equal(again.result.tools.length, 11, 'reload leaked the port');
     ext.unload();
 
 
@@ -170,7 +195,7 @@ async function assertPortFree() {
         fresh.load();
         await new Promise((r) => setTimeout(r, 200));
         const viaEnv = await (await post({ jsonrpc: '2.0', id: 19, method: 'tools/list' })).json();
-        assert.equal(viaEnv.result.tools.length, 10, 'COCOS_MCP_PORT must outrank .port');
+        assert.equal(viaEnv.result.tools.length, 11, 'COCOS_MCP_PORT must outrank .port');
         fresh.unload();
     } finally {
         if (hadPort === null) fs.unlinkSync(portFile);

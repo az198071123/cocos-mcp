@@ -4,9 +4,9 @@ An MCP server that runs **inside** the Cocos Creator editor process, so an AI as
 editor the same way you do: query the live scene graph, read and write assets, kick off builds, read the
 log, and look at a screenshot of what it just did.
 
-Ten tools. Zero dependencies. No build step. Tested against Cocos Creator 3.8.8.
+Eleven tools. Zero dependencies. No build step. Tested against Cocos Creator 3.8.8.
 
-## Why ten tools and not a hundred
+## Why eleven tools and not a hundred
 
 The editor API is huge — `scene` alone declares 200+ messages. Wrapping each one as its own MCP tool means
 a giant tool list permanently occupying the model's context, and a maintenance burden every time Creator
@@ -56,6 +56,7 @@ means the tool names (`mcp__cocos-creator__*`) stay stable wherever you are:
 | `editor_eval` | Async JS in the editor main process; `Editor` and `require` in scope |
 | `scene_eval` | Async JS in the scene process; `cc` and the live scene graph in scope |
 | `editor_api` | Greps the editor's `.d.ts` files for a message signature |
+| `asset_info` | One asset: size, sub-assets, resolved referencers, dependencies |
 | `build` | Starts a build, reusing the last task's options; `overrides` to change fields |
 | `build_status` | Task state, progress, and the messages carrying build errors |
 | `editor_log` | Tails `temp/logs/project.log` with a regex filter |
@@ -79,6 +80,15 @@ and `contributions.scene.script` is correct.
 exports.methods = { run(code) { /* ... */ } };   // right
 module.exports = { run(code) { /* ... */ } };    // silently never called
 ```
+
+**A reference index can name assets that are not in this checkout.** `query-asset-users` returns uuids, and
+some of them resolve to nothing — other branches that share the same asset folder, or deleted files. On a
+multi-game repo where every branch checks out only its own game code but shares `assets/common/`, this is
+routine: one shared image reported 61 referencers on one branch and 94 on another, plus 15 unresolvable
+either way. `asset_info` counts those separately as `ghostUsers` instead of silently inflating the total.
+
+**A zero reference count is not permission to delete.** It only means nothing in *this* checkout references
+it. Five images that looked dead on one branch turned out to be used by another game on a sibling branch.
 
 **`@cocos/creator-types` only covers a fraction of the API.** The bundled types declare ~51 `scene`
 messages; the running editor has 200+. `add-task`, `query-preview-url` and many others are declared only

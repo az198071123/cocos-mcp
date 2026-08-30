@@ -132,6 +132,23 @@ const TOOLS = [
         inputSchema: { type: 'object', properties: {} },
     },
     {
+        name: 'asset_info',
+        description:
+            'Everything about one asset in a single call: size, sub-assets, who references it (resolved to ' +
+            'paths and grouped by top-level folder), and what it depends on. Takes a db:// url or a uuid. ' +
+            'NOTE ON ghostUsers: the reference index can name assets that do not exist in this checkout — ' +
+            'other branches sharing this folder, or deleted files. A zero userCount therefore does NOT mean ' +
+            'the asset is unused; check the other branches before deleting anything.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                target: { type: 'string', description: 'db://assets/... url, or a uuid' },
+                limit: { type: 'number', description: 'how many user paths to list (default 20)' },
+            },
+            required: ['target'],
+        },
+    },
+    {
         name: 'editor_api',
         description:
             'Grep the bundled @cocos/creator-types .d.ts for a message name or type, returning its TypeScript ' +
@@ -289,6 +306,43 @@ async function callTool(name, a) {
                 }
             }, 300);
             return 'reload scheduled — back on this port in ~2s';
+        }
+        case 'asset_info': {
+            const info = await Editor.Message.request('asset-db', 'query-asset-info', a.target);
+            if (!info) throw new Error(`no such asset: ${a.target}`);
+            const [users, deps, meta] = await Promise.all([
+                Editor.Message.request('asset-db', 'query-asset-users', info.uuid).catch(() => []),
+                Editor.Message.request('asset-db', 'query-asset-dependencies', info.uuid).catch(() => []),
+                Editor.Message.request('asset-db', 'query-asset-meta', info.uuid).catch(() => null),
+            ]);
+            const paths = [];
+            let ghosts = 0;
+            for (const u of users || []) {
+                const ui = await Editor.Message.request('asset-db', 'query-asset-info', u).catch(() => null);
+                if (ui) paths.push(ui.source);
+                else ghosts++;
+            }
+            const byFolder = {};
+            for (const src of paths) {
+                const m = src.match(/^db:\/\/assets\/([^/]+)/);
+                const k = m ? m[1] : '?';
+                byFolder[k] = (byFolder[k] || 0) + 1;
+            }
+            let bytes = null;
+            try { bytes = fs.statSync(info.file).size; } catch (e) { /* directories and virtual assets */ }
+            const subMetas = (meta && meta.subMetas) || {};
+            return {
+                source: info.source,
+                uuid: info.uuid,
+                importer: info.importer,
+                bytes,
+                subAssets: Object.entries(subMetas).map(([id, m]) => `${info.uuid}@${id} (${m.importer})`),
+                userCount: paths.length,
+                ghostUsers: ghosts,
+                usersByFolder: byFolder,
+                users: paths.slice(0, a.limit || 20),
+                dependencies: (deps || []).length,
+            };
         }
         case 'editor_api':
             return grepTypes(a.query);
