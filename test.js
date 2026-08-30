@@ -135,6 +135,20 @@ const post = (body) =>
     assert.equal(again.result.tools.length, 9, 'reload leaked the port');
     ext.unload();
 
+    // .port is the per-project override; env must still win over it
+    fs.writeFileSync(path.join(__dirname, '.port'), '1399\n');
+    try {
+        delete require.cache[require.resolve('./main.js')];
+        const fresh = require('./main.js');
+        fresh.load();
+        await new Promise((r) => setTimeout(r, 200));
+        const viaEnv = await (await post({ jsonrpc: '2.0', id: 19, method: 'tools/list' })).json();
+        assert.equal(viaEnv.result.tools.length, 9, 'COCOS_MCP_PORT must outrank .port');
+        fresh.unload();
+    } finally {
+        fs.unlinkSync(path.join(__dirname, '.port'));
+    }
+
     console.log('all checks passed');
     process.exit(0);
 })();

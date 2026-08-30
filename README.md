@@ -28,7 +28,25 @@ the model looks up a signature and then calls it. Everything the big servers do 
    { "mcpServers": { "cocos-creator": { "type": "http", "url": "http://127.0.0.1:1314/mcp" } } }
    ```
 
-Set `COCOS_MCP_PORT` to use a different port.
+### Ports
+
+One editor instance per port. If you keep two projects open in Creator at once, the second one loses the
+race for 1314 and silently has no server, so give each project its own port — either via `COCOS_MCP_PORT`,
+or by dropping a `.port` file (gitignored) next to `main.js`:
+
+```sh
+echo 1315 > extensions/cocos-mcp/.port
+```
+
+Then point each project's MCP config at its own port. Keeping the server *name* the same across projects
+means the tool names (`mcp__cocos-creator__*`) stay stable wherever you are:
+
+```json
+{ "projects": {
+    "/path/to/project-a": { "mcpServers": { "cocos-creator": { "type": "http", "url": "http://127.0.0.1:1314/mcp" } } },
+    "/path/to/project-b": { "mcpServers": { "cocos-creator": { "type": "http", "url": "http://127.0.0.1:1315/mcp" } } }
+} }
+```
 
 ## Tools
 

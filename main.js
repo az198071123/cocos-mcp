@@ -8,7 +8,13 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = Number(process.env.COCOS_MCP_PORT) || 1314;
+// One editor per port: a second Creator instance needs its own, or it loses the race for 1314.
+// Precedence: COCOS_MCP_PORT env > a `.port` file next to this one (gitignored) > 1314.
+function resolvePort() {
+    if (process.env.COCOS_MCP_PORT) return Number(process.env.COCOS_MCP_PORT);
+    try { return Number(fs.readFileSync(path.join(__dirname, '.port'), 'utf8').trim()) || 0; } catch (e) { return 0; }
+}
+const PORT = resolvePort() || 1314;
 const MAX_CHARS = 20000;
 
 let server = null;
