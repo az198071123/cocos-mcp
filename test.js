@@ -66,6 +66,8 @@ global.Editor = {
                 if (t === 'db://assets/x.png' || t === 'U-IMG') {
                     return { source: 'db://assets/x.png', uuid: 'U-IMG', importer: 'image', file: __filename };
                 }
+                if (t === 'db://assets/dir') return { source: 'db://assets/dir', uuid: 'U-DIR', importer: 'directory', file: __dirname };
+                if (t === 'U-IMG@f9941') return { source: '', uuid: 'U-IMG@f9941', importer: 'sprite-frame', file: '' };
                 if (t === 'U-A') return { source: 'db://assets/common/a.prefab', uuid: 'U-A', importer: 'prefab' };
                 if (t === 'U-B') return { source: 'db://assets/op6/b.prefab', uuid: 'U-B', importer: 'prefab' };
                 return null; // U-GHOST: in the index, not in this checkout
@@ -231,6 +233,16 @@ async function assertPortFree() {
     builderBusy = false;
     const qf = await (await post({ jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'build', arguments: {} } })).json();
     assert.equal(JSON.parse(qf.result.content[0].text).queuedBehind, undefined, 'idle builder must not add noise');
+
+    // a directory's inode size is not its content size — reporting it invites wrong conclusions
+    const dir = await (await post({ jsonrpc: '2.0', id: 32, method: 'tools/call', params: { name: 'asset_info', arguments: { target: 'db://assets/dir' } } })).json();
+    assert.equal(JSON.parse(dir.result.content[0].text).bytes, null, 'directory bytes must be null, not the inode size');
+
+    // sub-assets carry no source of their own; name them after the parent
+    const sub = await (await post({ jsonrpc: '2.0', id: 33, method: 'tools/call', params: { name: 'asset_info', arguments: { target: 'U-IMG@f9941' } } })).json();
+    const subj = JSON.parse(sub.result.content[0].text);
+    assert.equal(subj.source, 'db://assets/x.png@f9941', 'sub-asset source should resolve via parent, got: ' + subj.source);
+    assert.equal(subj.bytes, null);
 
     // reload must reply BEFORE tearing the server down, then disable/enable this very directory
     const rel = await (await post({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'reload', arguments: {} } })).json();

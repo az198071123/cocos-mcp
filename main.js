@@ -407,10 +407,21 @@ async function callTool(name, a) {
                 byFolder[k] = (byFolder[k] || 0) + 1;
             }
             let bytes = null;
-            try { bytes = fs.statSync(info.file).size; } catch (e) { /* directories and virtual assets */ }
+            try {
+                const st = fs.statSync(info.file);
+                // A directory's own inode size (a few hundred bytes) says nothing about what is inside it.
+                if (st.isFile()) bytes = st.size;
+            } catch (e) { /* sub-assets have no file of their own */ }
+            // Sub-assets (uuid@sub) come back with an empty source, so name them after their parent.
+            let source = info.source;
+            if (!source && String(a.target).includes('@')) {
+                const [parentUuid, sub] = String(a.target).split('@');
+                const parent = await Editor.Message.request('asset-db', 'query-asset-info', parentUuid).catch(() => null);
+                if (parent) source = `${parent.source}@${sub}`;
+            }
             const subMetas = (meta && meta.subMetas) || {};
             return {
-                source: info.source,
+                source,
                 uuid: info.uuid,
                 importer: info.importer,
                 bytes,
