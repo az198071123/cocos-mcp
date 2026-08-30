@@ -59,7 +59,7 @@ means the tool names (`mcp__cocos-creator__*`) stay stable wherever you are:
 | `asset_info` | One asset: size, sub-assets, resolved referencers, dependencies |
 | `build` | Starts a build, reusing the last task's options; `overrides` to change fields |
 | `build_status` | Task state, progress, and the messages carrying build errors |
-| `editor_log` | Tails `temp/logs/project.log` with a regex filter |
+| `editor_log` | Tails the project / builder / asset-db log with a regex filter |
 | `screenshot` | Captures an editor window as a PNG image block |
 | `preview` | Preview server URL, platform, and connection count |
 | `reload` | Reloads this extension so code edits take effect |
@@ -100,6 +100,17 @@ meanings. `build` decodes whichever applies.
 
 **Build warnings are not in `build_status`.** Its `detailMessage` only carries the last hook name. Real
 warnings and errors go to `temp/logs/project.log` — use `editor_log`.
+
+**Bad build options queue successfully, then fail silently.** `add-task` accepts anything — an invalid
+platform gets a cheerful `SUCCESS (queued)`, and the task only fails later with `构建参数校验失败` and an
+*empty* `detailMessage`, so nothing tells you which option was wrong. `build` now runs options through the
+builder's own `check-and-complete-options` first, which rejects them up front and lists the valid platforms.
+That call also completes every required field and follows `taskName` to `outputName`, so it beats merging a
+previous task's options by hand.
+
+**Build detail lives in the builder's own log.** `temp/logs/project.log` gets the warnings, but
+`editor_log` with `source: "builder"` reaches `temp/builder/log/`, which has per-stage timings and memory
+tracking. Those files run to megabytes, so only the tail is read.
 
 **Reloading needs a deferred disable/enable.** The `reload` tool handles it: it replies *first*, then tears
 the server down 300 ms later — disabling the package kills the HTTP server, so doing it inline loses the

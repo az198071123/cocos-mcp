@@ -91,12 +91,15 @@ const TOOLS = [
     {
         name: 'editor_log',
         description:
-            'Tail the editor log (temp/logs/project.log). This is where build warnings and errors actually land — ' +
-            'build_status only carries the last hook name, so check here after a build. grep is a case-insensitive ' +
-            'regex; stack traces are noisy, so filter rather than raising lines.',
+            'Tail an editor log. source "project" (default) is temp/logs/project.log, where build warnings and ' +
+            'errors surface — build_status only carries the last hook name, so check here after a build. ' +
+            '"builder" and "asset-db" are the newest file in those packages\' own log directories, with far more ' +
+            'detail when a build fails or an import goes wrong. grep is a case-insensitive regex; stack traces ' +
+            'are noisy, so filter rather than raising lines.',
         inputSchema: {
             type: 'object',
             properties: {
+                source: { type: 'string', enum: ['project', 'builder', 'asset-db'], description: 'default "project"' },
                 lines: { type: 'number', description: 'how many trailing lines (default 80)' },
                 grep: { type: 'string', description: 'case-insensitive regex filter, e.g. "warn|error"' },
             },
@@ -213,15 +216,28 @@ const ADD_RESULT = { 0: 'BUSY (a build is already running)', 1: 'SUCCESS (queued
 const EXIT_CODE = { 32: 'PARAM_ERROR', 34: 'BUILD_FAILED', 36: 'BUILD_SUCCESS', 37: 'BUILD_BUSY', 50: 'UNKNOWN_ERROR' };
 
 async function buildOptions(overrides) {
-    const info = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' });
-    const last = (info.list || []).filter((t) => t.options).pop();
-    let base = last && last.options;
-    if (!base) {
-        const profile = path.join(Editor.Project.path, 'profiles/v2/packages/builder.json');
-        base = JSON.parse(fs.readFileSync(profile, 'utf8')).common;
+    const o = Object.assign({}, overrides);
+    // check-and-complete-options needs a platform to look its config up; everything else it fills in.
+    if (!o.platform) {
+        const info = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' }).catch(() => null);
+        const last = info && (info.list || []).filter((t) => t.options && t.options.platform).pop();
+        if (last) o.platform = last.options.platform;
+        else {
+            const profile = path.join(Editor.Project.path, 'profiles/v2/packages/builder.json');
+            o.platform = JSON.parse(fs.readFileSync(profile, 'utf8')).common.platform;
+        }
     }
-    if (!base) throw new Error('no build options found: run a build from the editor panel once first');
-    return Object.assign({}, base, overrides || {});
+    try {
+        // The builder validates and completes far better than merging a previous task's options by hand:
+        // it fills every required field, follows taskName to outputName, and swaps platform-specific packages.
+        return await Editor.Message.request('builder', 'check-and-complete-options', o);
+    } catch (e) {
+        const cfg = await Editor.Message.request('builder', 'query-platform-config').catch(() => null);
+        const valid = cfg && cfg.order ? ` Valid platforms: ${cfg.order.join(', ')}.` : '';
+        // Without this, add-task happily queues bad options and only says "参数校验失败" once the task fails,
+        // with an empty detailMessage — so validate up front instead.
+        throw new Error(`builder rejected these build options: ${e.message}.${valid}`);
+    }
 }
 
 function taskBrief(t) {
@@ -236,6 +252,36 @@ function taskBrief(t) {
         dest: t.options && `${t.options.buildPath}/${t.options.outputName}`,
     };
 }
+
+// Editor logs reach megabytes; read only the tail rather than pulling the whole file into memory.
+function tailFile(file, maxBytes) {
+    const size = fs.statSync(file).size;
+    const start = Math.max(0, size - (maxBytes || 512 * 1024));
+    const fd = fs.openSync(file, 'r');
+    try {
+        const buf = Buffer.alloc(size - start);
+        fs.readSync(fd, buf, 0, buf.length, start);
+        const text = buf.toString('utf8');
+        return start > 0 ? text.slice(text.indexOf('\n') + 1) : text; // drop the partial first line
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
+function newestFileIn(dir) {
+    const files = fs.readdirSync(dir)
+        .map((n) => path.join(dir, n))
+        .filter((f) => { try { return fs.statSync(f).isFile(); } catch (e) { return false; } });
+    if (!files.length) throw new Error(`no log files in ${dir}`);
+    return files.sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+}
+
+// builder/ and asset-db/ keep timestamped log files in a directory; project.log is a single file.
+const LOG_SOURCES = {
+    project: (tmp) => path.join(tmp, 'logs/project.log'),
+    builder: (tmp) => newestFileIn(path.join(tmp, 'builder/log')),
+    'asset-db': (tmp) => newestFileIn(path.join(tmp, 'asset-db/log')),
+};
 
 async function callTool(name, a) {
     switch (name) {
@@ -270,10 +316,13 @@ async function callTool(name, a) {
             return { free: info.free, tasks: (info.list || []).map(taskBrief) };
         }
         case 'editor_log': {
-            const file = path.join(Editor.Project.tmpDir, 'logs/project.log');
-            const all = fs.readFileSync(file, 'utf8').split('\n');
+            const pick = LOG_SOURCES[a.source || 'project'];
+            if (!pick) throw new Error(`unknown log source "${a.source}" — use one of: ${Object.keys(LOG_SOURCES).join(', ')}`);
+            const file = pick(Editor.Project.tmpDir);
+            // A trailing newline yields an empty last element; lines:1 would return just that blank.
+            const all = tailFile(file).replace(/\n$/, '').split('\n');
             const lines = a.grep ? all.filter((l) => new RegExp(a.grep, 'i').test(l)) : all;
-            return lines.slice(-(a.lines || 80)).join('\n');
+            return `# ${file.replace(Editor.Project.path, '')}\n${lines.slice(-(a.lines || 80)).join('\n')}`;
         }
         case 'screenshot': {
             const { BrowserWindow } = require('electron');

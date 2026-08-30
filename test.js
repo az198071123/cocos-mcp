@@ -12,6 +12,14 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cocos-mcp-'));
 const PROJECT = path.resolve(__dirname, '../..');
 fs.mkdirSync(path.join(tmp, 'logs'));
 fs.writeFileSync(path.join(tmp, 'logs/project.log'), 'a info 1\nb warn 2\nc warn 3\nd info 4\n');
+for (const [dir, files] of [['builder/log', [['old.log', 'stale builder line\n'], ['new.log', 'BUILDER TAIL\n']]],
+                            ['asset-db/log', [['db.log', 'ASSETDB TAIL\n']]]]) {
+    fs.mkdirSync(path.join(tmp, dir), { recursive: true });
+    for (const [n, body] of files) fs.writeFileSync(path.join(tmp, dir, n), body);
+}
+// make 'new.log' unambiguously newest, and give it a body larger than the tail window
+fs.writeFileSync(path.join(tmp, 'builder/log/new.log'), 'X'.repeat(700 * 1024) + '\nBUILDER TAIL\n');
+fs.utimesSync(path.join(tmp, 'builder/log/old.log'), new Date(0), new Date(0));
 require('module')._load = ((orig) => function (req, ...rest) {
     if (req === 'electron') {
         return { BrowserWindow: { getAllWindows: () => [{
@@ -38,6 +46,12 @@ global.Editor = {
                     }],
                 };
             }
+            if (pkg === 'builder' && method === 'check-and-complete-options') {
+                const o = args[0];
+                if (!['web-mobile', 'web-desktop'].includes(o.platform)) throw new Error('Cannot convert undefined or null to object');
+                return Object.assign({ buildPath: 'project://build', outputName: 'web-mobile-001', taskName: 'web-mobile-001' }, o);
+            }
+            if (pkg === 'builder' && method === 'query-platform-config') return { order: ['web-mobile', 'web-desktop'] };
             if (pkg === 'builder' && method === 'add-task') { addTaskArgs = args; return args[1] ? 36 : 1; }
             if (pkg === 'asset-db' && method === 'query-asset-info') {
                 const t = args[0];
@@ -135,7 +149,7 @@ async function assertPortFree() {
     assert.equal(shot.result.content[0].data, FAKE_PNG.toString('base64'), 'base64 must survive intact');
 
     const log = await (await post({ jsonrpc: '2.0', id: 14, method: 'tools/call', params: { name: 'editor_log', arguments: { grep: 'warn', lines: 2 } } })).json();
-    assert.equal(log.result.content[0].text, 'b warn 2\nc warn 3', 'grep+tail wrong: ' + log.result.content[0].text);
+    assert.match(log.result.content[0].text, /b warn 2\nc warn 3$/, 'grep+tail wrong: ' + log.result.content[0].text);
 
     const pv = await (await post({ jsonrpc: '2.0', id: 15, method: 'tools/call', params: { name: 'preview', arguments: {} } })).json();
     assert.match(pv.result.content[0].text, /7456/);
@@ -165,6 +179,24 @@ async function assertPortFree() {
 
     const miss = await (await post({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'asset_info', arguments: { target: 'db://nope' } } })).json();
     assert.equal(miss.result.isError, true, 'a missing asset must surface as an error');
+
+    // log sources: builder/asset-db resolve to the newest file in their directory
+    const lb = await (await post({ jsonrpc: '2.0', id: 23, method: 'tools/call', params: { name: 'editor_log', arguments: { source: 'builder', lines: 1 } } })).json();
+    assert.match(lb.result.content[0].text, /BUILDER TAIL/, 'builder log should read the newest file, got: ' + lb.result.content[0].text.slice(0, 120));
+    assert.match(lb.result.content[0].text, /^# .*builder\/log\/new\.log/m, 'output should name the file it read');
+    assert.ok(lb.result.content[0].text.length < 5000, 'a 700KB log must be tailed, not returned whole');
+
+    const ld = await (await post({ jsonrpc: '2.0', id: 24, method: 'tools/call', params: { name: 'editor_log', arguments: { source: 'asset-db', lines: 1 } } })).json();
+    assert.match(ld.result.content[0].text, /ASSETDB TAIL/);
+
+    const lbad = await (await post({ jsonrpc: '2.0', id: 25, method: 'tools/call', params: { name: 'editor_log', arguments: { source: 'nope' } } })).json();
+    assert.equal(lbad.result.isError, true);
+    assert.match(lbad.result.content[0].text, /project, builder, asset-db/, 'bad source must list the valid ones');
+
+    // an invalid platform must be rejected up front, not queued and left to fail with an empty detailMessage
+    const badPlat = await (await post({ jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'build', arguments: { overrides: { platform: 'not-a-platform' } } } })).json();
+    assert.equal(badPlat.result.isError, true, 'invalid platform must error, not queue');
+    assert.match(badPlat.result.content[0].text, /Valid platforms: web-mobile, web-desktop/, 'error must list valid platforms: ' + badPlat.result.content[0].text);
 
     // reload must reply BEFORE tearing the server down, then disable/enable this very directory
     const rel = await (await post({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'reload', arguments: {} } })).json();
