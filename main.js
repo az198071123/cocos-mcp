@@ -324,10 +324,17 @@ async function callTool(name, a) {
             const code = await Editor.Message.request('builder', 'add-task', options, !!a.wait);
             const after = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' });
             const task = (after.list || []).filter((t) => !known.has(t.id)).pop() || (after.list || []).pop();
+            // add-task returns SUCCESS even when another build is already running; the new task just sits
+            // there with "build task is busy". info.free stays true in that state, so it cannot be used —
+            // look at the other tasks' states instead.
+            const ahead = (before.list || [])
+                .filter((t) => t.state === 'processing' || t.state === 'waiting')
+                .map((t) => t.id);
             return {
                 result: a.wait ? EXIT_CODE[code] || code : ADD_RESULT[code] || code,
                 platform: options.platform,
                 dest: `${options.buildPath}/${options.outputName}`,
+                queuedBehind: ahead.length ? ahead : undefined,
                 task: task ? taskBrief(task) : null,
             };
         }

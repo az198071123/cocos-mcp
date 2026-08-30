@@ -6,6 +6,7 @@ const assert = require('assert');
 let addTaskArgs = null;
 const pkgCalls = [];
 let scenePingAlive = true;
+let builderBusy = false;
 const FAKE_PNG = Buffer.from('fake png bytes');
 const fs = require('fs'), os = require('os'), path = require('path');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cocos-mcp-'));
@@ -45,12 +46,12 @@ global.Editor = {
             }
             if (pkg === 'builder' && method === 'query-tasks-info') {
                 return {
-                    free: true,
+                    free: true, // deliberately true even when busy — mirrors the real builder
                     queue: {},
-                    list: [{
+                    list: (builderBusy ? [{ id: 'RUNNING', state: 'processing', progress: 0.2, message: '', options: { platform: 'web-mobile', buildPath: 'project://build', outputName: 'x' } }] : []).concat([{
                         id: 'T1', state: 'success', progress: 1, message: 'build success in 58 s!', time: 'x',
                         options: { platform: 'web-mobile', buildPath: 'project://build', outputName: 'web-mobile-001' },
-                    }],
+                    }]),
                 };
             }
             if (pkg === 'builder' && method === 'check-and-complete-options') {
@@ -222,6 +223,14 @@ async function assertPortFree() {
     assert.equal(dead.result.isError, true, 'unregistered scene script must surface, not return undefined');
     assert.match(dead.result.content[0].text, /not registered/);
     scenePingAlive = true;
+
+    // a build queued behind another must say so — add-task reports SUCCESS either way
+    builderBusy = true;
+    const qb = await (await post({ jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'build', arguments: {} } })).json();
+    assert.deepEqual(JSON.parse(qb.result.content[0].text).queuedBehind, ['RUNNING'], 'must report what it is queued behind');
+    builderBusy = false;
+    const qf = await (await post({ jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'build', arguments: {} } })).json();
+    assert.equal(JSON.parse(qf.result.content[0].text).queuedBehind, undefined, 'idle builder must not add noise');
 
     // reload must reply BEFORE tearing the server down, then disable/enable this very directory
     const rel = await (await post({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'reload', arguments: {} } })).json();

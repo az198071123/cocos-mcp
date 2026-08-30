@@ -107,6 +107,12 @@ meanings. `build` decodes whichever applies.
 **Build warnings are not in `build_status`.** Its `detailMessage` only carries the last hook name. Real
 warnings and errors go to `temp/logs/project.log` — use `editor_log`.
 
+**A second build queues silently, and `free` does not tell you.** `add-task` returns `SUCCESS` even when a
+build is already running — the new task just sits there with `Wait a moment, build task is busy` in its
+message. `query-tasks-info().free` stays `true` throughout, so it cannot be used to detect this; check task
+`state` for `processing`/`waiting` instead. `build` now reports `queuedBehind` with those ids.
+Cancel with `editor_request builder break-task [id]`.
+
 **Bad build options queue successfully, then fail silently.** `add-task` accepts anything — an invalid
 platform gets a cheerful `SUCCESS (queued)`, and the task only fails later with `构建参数校验失败` and an
 *empty* `detailMessage`, so nothing tells you which option was wrong. `build` now runs options through the
