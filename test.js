@@ -48,10 +48,13 @@ global.Editor = {
                 return {
                     free: true, // deliberately true even when busy — mirrors the real builder
                     queue: {},
-                    list: (builderBusy ? [{ id: 'RUNNING', state: 'processing', progress: 0.2, message: '', options: { platform: 'web-mobile', buildPath: 'project://build', outputName: 'x' } }] : []).concat([{
-                        id: 'T1', state: 'success', progress: 1, message: 'build success in 58 s!', time: 'x',
-                        options: { platform: 'web-mobile', buildPath: 'project://build', outputName: 'web-mobile-001' },
-                    }]),
+                    list: (builderBusy ? [{ id: '3000', state: 'processing', progress: 0.2, message: '', options: { platform: 'web-mobile', buildPath: 'project://build', outputName: 'x' } }] : []).concat([
+                        // deliberately oldest-first, with a different platform, to catch .pop()
+                        { id: '1000', state: 'success', progress: 1, message: 'older', time: 'x',
+                          options: { platform: 'web-desktop', buildPath: 'project://build', outputName: 'old' } },
+                        { id: '2000', state: 'success', progress: 1, message: 'build success in 58 s!', time: 'x',
+                          options: { platform: 'web-mobile', buildPath: 'project://build', outputName: 'web-mobile-001' } },
+                    ]),
                 };
             }
             if (pkg === 'builder' && method === 'check-and-complete-options') {
@@ -143,7 +146,7 @@ async function assertPortFree() {
     assert.equal(bj.result, 'SUCCESS (queued)', 'no-wait must decode TaskAddResult, got ' + bj.result);
     assert.equal(bj.dest, 'project://build/web-mobile-001');
     assert.equal(addTaskArgs[0].debug, true, 'overrides not merged');
-    assert.equal(addTaskArgs[0].platform, 'web-mobile', 'base options not inherited');
+    assert.equal(addTaskArgs[0].platform, 'web-mobile', 'must inherit the NEWEST task by id, not the first or last in the list');
     assert.equal(addTaskArgs[1], false, 'shouldWait must default to false');
 
     const bw = await (await post({ jsonrpc: '2.0', id: 11, method: 'tools/call', params: { name: 'build', arguments: { wait: true } } })).json();
@@ -184,7 +187,8 @@ async function assertPortFree() {
     assert.equal(aij.ghostUsers, 2, 'unresolvable users must be reported, not dropped');
     assert.deepEqual(aij.usersByFolder, { common: 1, op6: 1 });
     assert.deepEqual(aij.subAssets, ['U-IMG@f9941 (sprite-frame)', 'U-IMG@6c48a (texture)']);
-    assert.equal(aij.dependencies, 2);
+    assert.equal(aij.dependencyCount, 2);
+    assert.deepEqual(aij.dependencies, ['D1', 'D2'], 'the description promises dependencies, not a count');
     assert.ok(aij.bytes > 0, 'bytes should come from the file on disk');
 
     const miss = await (await post({ jsonrpc: '2.0', id: 22, method: 'tools/call', params: { name: 'asset_info', arguments: { target: 'db://nope' } } })).json();
@@ -229,7 +233,7 @@ async function assertPortFree() {
     // a build queued behind another must say so — add-task reports SUCCESS either way
     builderBusy = true;
     const qb = await (await post({ jsonrpc: '2.0', id: 30, method: 'tools/call', params: { name: 'build', arguments: {} } })).json();
-    assert.deepEqual(JSON.parse(qb.result.content[0].text).queuedBehind, ['RUNNING'], 'must report what it is queued behind');
+    assert.deepEqual(JSON.parse(qb.result.content[0].text).queuedBehind, ['3000'], 'must report what it is queued behind');
     builderBusy = false;
     const qf = await (await post({ jsonrpc: '2.0', id: 31, method: 'tools/call', params: { name: 'build', arguments: {} } })).json();
     assert.equal(JSON.parse(qf.result.content[0].text).queuedBehind, undefined, 'idle builder must not add noise');
@@ -243,6 +247,57 @@ async function assertPortFree() {
     const subj = JSON.parse(sub.result.content[0].text);
     assert.equal(subj.source, 'db://assets/x.png@f9941', 'sub-asset source should resolve via parent, got: ' + subj.source);
     assert.equal(subj.bytes, null);
+
+    // SECURITY: a page the developer visits must not reach editor_eval. Browsers always send
+    // Origin; text/plain needs no preflight, so without this check the request goes straight through.
+    const drive = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'text/plain', origin: 'https://evil.example' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 90, method: 'tools/call', params: { name: 'editor_eval', arguments: { code: 'return 1' } } }),
+    });
+    assert.equal(drive.status, 403, 'a request carrying Origin must be refused');
+
+    // A multibyte character split across TCP segments must survive.
+    const cjk = '排資源要用壓縮後大小';
+    const raw = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 91, method: 'tools/call', params: { name: 'editor_eval', arguments: { code: `return ${JSON.stringify(cjk)}` } } }), 'utf8');
+    const cut = raw.indexOf(Buffer.from(cjk, 'utf8')) + 1; // one byte into the first CJK char
+    const split = await new Promise((resolve, reject) => {
+        const sock = require('net').createConnection(PORT, '127.0.0.1', () => {
+            sock.write(`POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: ${raw.length}\r\nConnection: close\r\n\r\n`);
+            sock.write(raw.subarray(0, cut));
+            setTimeout(() => sock.write(raw.subarray(cut)), 30);
+        });
+        let buf = '';
+        sock.on('data', (d) => (buf += d.toString('utf8')));
+        sock.on('end', () => resolve(buf));
+        sock.on('error', reject);
+    });
+    assert.ok(split.includes(cjk), 'multibyte split across chunks was mangled: ' + split.slice(-160));
+
+    // An oversized body must be refused rather than buffered.
+    const big = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: 'x'.repeat(5 * 1024 * 1024),
+    }).catch((e) => ({ status: 'connection closed: ' + e.message }));
+    assert.equal(big.status, 413, 'oversized body must be rejected, got ' + big.status);
+
+    // Malformed JSON should say so, not return an empty 400.
+    const badJson = await fetch(`http://127.0.0.1:${PORT}/mcp`, { method: 'POST', body: '{nope' });
+    assert.equal(badJson.status, 400);
+    assert.match(await badJson.text(), /invalid JSON/);
+
+    // truncation notice must say how much was cut, and must not leak source-level string concat
+    const trunc = await (await post({ jsonrpc: '2.0', id: 92, method: 'tools/call', params: { name: 'editor_eval', arguments: { code: "return 'x'.repeat(25000)" } } })).json();
+    const tail = trunc.result.content[0].text.slice(-200);
+    assert.match(tail, /truncated: showing 20000 of 25000 chars/, 'wrong truncation numbers: ' + tail);
+    assert.ok(!tail.includes('" +'), 'truncation notice leaked a string-concat artifact: ' + tail);
+
+    // initialize must not claim to speak a version it does not implement
+    const okVer = await (await post({ jsonrpc: '2.0', id: 93, method: 'initialize', params: { protocolVersion: '2024-11-05' } })).json();
+    assert.equal(okVer.result.protocolVersion, '2024-11-05', 'a supported version should be echoed');
+    const badVer = await (await post({ jsonrpc: '2.0', id: 94, method: 'initialize', params: { protocolVersion: '1999-01-01' } })).json();
+    assert.equal(badVer.result.protocolVersion, '2025-06-18', 'an unknown version must not be echoed back');
 
     // reload must reply BEFORE tearing the server down, then disable/enable this very directory
     const rel = await (await post({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'reload', arguments: {} } })).json();
@@ -278,6 +333,22 @@ async function assertPortFree() {
     } finally {
         if (hadPort === null) fs.unlinkSync(portFile);
         else fs.writeFileSync(portFile, hadPort);
+    }
+
+    // a malformed .port must refuse to load — falling back to 1314 is the collision it exists to prevent
+    {
+        const saved = process.env.COCOS_MCP_PORT;
+        delete process.env.COCOS_MCP_PORT;
+        fs.writeFileSync(portFile, 'not-a-port\n');
+        try {
+            delete require.cache[require.resolve('./main.js')];
+            assert.throws(() => require('./main.js'), /not a port number/, 'a malformed .port must throw');
+        } finally {
+            if (hadPort === null) { try { fs.unlinkSync(portFile); } catch (e) { /* already gone */ } }
+            else fs.writeFileSync(portFile, hadPort);
+            process.env.COCOS_MCP_PORT = saved;
+            delete require.cache[require.resolve('./main.js')];
+        }
     }
 
     console.log('all checks passed');

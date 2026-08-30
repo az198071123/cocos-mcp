@@ -85,6 +85,8 @@ this extension made itself while working around the first half.
 | `bytes: 960` on a folder | the directory inode, not the 62 KB inside it *(our bug)* |
 | a blank line from a log | the file ended with a newline *(our bug)* |
 | a green test run | `listen()` lost the port and every assertion ran against a live editor *(our bug)* |
+| `127.0.0.1` in the bind call | any web page could still POST here and run code *(our bug)* |
+| `truncated, 25000 of 25000 chars` | the notice never said anything was cut *(our bug)* |
 | a missing `.port` file | the test suite deleted it in a `finally` block *(our bug)* |
 | `no match` from `editor_api` | it was only searching a quarter of the API *(our bug)* |
 
@@ -185,8 +187,18 @@ against a live editor. Override with `COCOS_MCP_PORT`.
 
 ## Security
 
-`editor_eval` and `scene_eval` execute arbitrary code with full editor privileges. The server binds to
-`127.0.0.1` only. Do not change that.
+`editor_eval` and `scene_eval` execute arbitrary code with full editor privileges, so the server has to
+assume any request could be hostile.
+
+**Binding to `127.0.0.1` is not enough, and believing otherwise was a real hole here.** A page the
+developer visits while Creator is open can POST to a loopback port: `text/plain` makes it a CORS *simple
+request*, so there is no preflight to block, and although the attacker cannot read the reply, the code
+has already run. Confirmed against an earlier build of this server — a cross-origin request executed
+`require('os').hostname()` inside the editor.
+
+Two things guard it now: any request carrying an `Origin` header is refused with 403 (browsers always
+send one, MCP clients never do), and bodies over 4 MB are rejected before being buffered. Keep both.
+Anything that reaches this port can run code as the editor.
 
 ## License
 

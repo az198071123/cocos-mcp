@@ -11,10 +11,22 @@ const path = require('path');
 // One editor per port: a second Creator instance needs its own, or it loses the race for 1314.
 // Precedence: COCOS_MCP_PORT env > a `.port` file next to this one (gitignored) > 1314.
 function resolvePort() {
-    if (process.env.COCOS_MCP_PORT) return Number(process.env.COCOS_MCP_PORT);
-    try { return Number(fs.readFileSync(path.join(__dirname, '.port'), 'utf8').trim()) || 0; } catch (e) { return 0; }
+    let raw = process.env.COCOS_MCP_PORT;
+    let from = 'COCOS_MCP_PORT';
+    if (!raw) {
+        from = '.port';
+        try { raw = fs.readFileSync(path.join(__dirname, '.port'), 'utf8').trim(); } catch (e) { raw = ''; }
+    }
+    if (!raw) return 1314;
+    const n = Number(raw);
+    // Falling back to 1314 on a typo reinstates the very collision .port exists to prevent,
+    // and the loser of that race ends up with no server at all.
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        throw new Error(`[cocos-mcp] ${from} is "${raw}", which is not a port number`);
+    }
+    return n;
 }
-const PORT = resolvePort() || 1314;
+const PORT = resolvePort();
 const MAX_CHARS = 20000;
 
 let server = null;
@@ -220,7 +232,9 @@ async function buildOptions(overrides) {
     // check-and-complete-options needs a platform to look its config up; everything else it fills in.
     if (!o.platform) {
         const info = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' }).catch(() => null);
-        const last = info && (info.list || []).filter((t) => t.options && t.options.platform).pop();
+        // The list runs newest-first, but aborted tasks sink to the end — sort by id (a
+        // creation timestamp) rather than trusting the order. .pop() picked the OLDEST build.
+        const last = info && newestTask((info.list || []).filter((t) => t.options && t.options.platform));
         if (last) o.platform = last.options.platform;
         else {
             const profile = path.join(Editor.Project.path, 'profiles/v2/packages/builder.json');
@@ -238,6 +252,11 @@ async function buildOptions(overrides) {
         // with an empty detailMessage — so validate up front instead.
         throw new Error(`builder rejected these build options: ${e.message}.${valid}`);
     }
+}
+
+// Task ids are creation timestamps; the list's own order is not dependable.
+function newestTask(tasks) {
+    return tasks.slice().sort((a, b) => Number(b.id) - Number(a.id))[0] || null;
 }
 
 function taskBrief(t) {
@@ -393,13 +412,11 @@ async function callTool(name, a) {
                 Editor.Message.request('asset-db', 'query-asset-dependencies', info.uuid).catch(() => []),
                 Editor.Message.request('asset-db', 'query-asset-meta', info.uuid).catch(() => null),
             ]);
-            const paths = [];
-            let ghosts = 0;
-            for (const u of users || []) {
-                const ui = await Editor.Message.request('asset-db', 'query-asset-info', u).catch(() => null);
-                if (ui) paths.push(ui.source);
-                else ghosts++;
-            }
+            const resolved = await Promise.all(
+                (users || []).map((u) => Editor.Message.request('asset-db', 'query-asset-info', u).catch(() => null)),
+            );
+            const paths = resolved.filter(Boolean).map((ui) => ui.source);
+            const ghosts = resolved.length - paths.length;
             const byFolder = {};
             for (const src of paths) {
                 const m = src.match(/^db:\/\/assets\/([^/]+)/);
@@ -430,7 +447,8 @@ async function callTool(name, a) {
                 ghostUsers: ghosts,
                 usersByFolder: byFolder,
                 users: paths.slice(0, a.limit || 20),
-                dependencies: (deps || []).length,
+                dependencyCount: (deps || []).length,
+                dependencies: (deps || []).slice(0, a.limit || 20),
             };
         }
         case 'editor_api':
@@ -450,10 +468,12 @@ function clip(value) {
     if (text === undefined) text = 'undefined';
     if (text === '') text = '(empty string)';
     return text.length > MAX_CHARS
-        ? `${text.slice(0, MAX_CHARS)}\n...[truncated, ${text.length} of ${text.length} chars — do not retry as-is. " +
-              "Aggregate inside editor_eval instead: loop the query there and return only the fields you need.]`
+        ? `${text.slice(0, MAX_CHARS)}\n...[truncated: showing ${MAX_CHARS} of ${text.length} chars. ` +
+          'Do not retry as-is — aggregate inside editor_eval and return only the fields you need.]'
         : text;
 }
+
+const SUPPORTED_PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
 const RESOURCES = [
     { uri: 'cocos://project', name: 'Project', description: 'Project path, name, preview URL and platform', mimeType: 'application/json' },
@@ -480,7 +500,7 @@ async function readResource(uri) {
             });
         case 'cocos://build/latest': {
             const info = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' });
-            const last = (info.list || [])[0];
+            const last = newestTask(info.list || []);
             return { free: info.free, latest: last ? taskBrief(last) : null };
         }
         case 'cocos://log/recent':
@@ -493,7 +513,10 @@ async function handle(msg) {
     const { method, params } = msg;
     if (method === 'initialize') {
         return {
-            protocolVersion: (params && params.protocolVersion) || '2025-06-18',
+            // Echoing an unknown version would claim support we do not have.
+            protocolVersion: SUPPORTED_PROTOCOLS.includes(params && params.protocolVersion)
+                ? params.protocolVersion
+                : SUPPORTED_PROTOCOLS[0],
             capabilities: { tools: {}, resources: {} },
             serverInfo: { name: 'cocos-mcp', version: '1.0.0' },
         };
@@ -519,19 +542,57 @@ async function handle(msg) {
     throw Object.assign(new Error(`method not found: ${method}`), { code: -32601 });
 }
 
+const MAX_BODY = 4 * 1024 * 1024;
+
 function onRequest(req, res) {
+    // A browser always sends Origin; an MCP client never does. Without this check, any page the
+    // developer visits while Creator is open can POST here as a CORS simple request — text/plain
+    // needs no preflight, and editor_eval is new Function with require in scope. The attacker
+    // cannot read the reply, but the code has already run. Binding to 127.0.0.1 does not help:
+    // the request originates from this machine.
+    if (req.headers.origin) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end('origin not allowed\n');
+        return;
+    }
     if (req.method !== 'POST') {
         res.writeHead(405).end();
         return;
     }
-    let body = '';
-    req.on('data', (c) => (body += c));
+    // Refuse on the declared length first: rejecting mid-upload reaches the client as a
+    // connection error instead of the 413. The streaming check below still covers a chunked
+    // request or a lying Content-Length.
+    if (Number(req.headers['content-length']) > MAX_BODY) {
+        res.writeHead(413, { 'Content-Type': 'text/plain' });
+        res.end('body too large\n');
+        return;
+    }
+    const chunks = [];
+    let size = 0;
+    let rejected = false;
+    req.on('data', (c) => {
+        if (rejected) return;
+        size += c.length;
+        if (size > MAX_BODY) {
+            rejected = true;
+            // Reply and stop buffering, but do not destroy the socket: resetting it mid-upload
+            // surfaces on the client as ECONNRESET instead of the 413 we just sent.
+            res.writeHead(413, { 'Content-Type': 'text/plain', Connection: 'close' });
+            res.end('body too large\n');
+            return;
+        }
+        chunks.push(c);
+    });
     req.on('end', async () => {
+        if (rejected) return;
+        // Decode once, at the end: `body += chunk` stringifies each Buffer on its own, so a
+        // multibyte character split across TCP segments decodes as replacement characters.
         let msg;
         try {
-            msg = JSON.parse(body);
+            msg = JSON.parse(Buffer.concat(chunks).toString('utf8'));
         } catch (e) {
-            res.writeHead(400).end();
+            res.writeHead(400, { 'Content-Type': 'text/plain' });
+            res.end(`invalid JSON: ${e.message}\n`);
             return;
         }
         const batch = Array.isArray(msg) ? msg : [msg];
