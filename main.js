@@ -289,12 +289,34 @@ async function callTool(name, a) {
             return await Editor.Message.request(a.pkg, a.method, ...(a.args || []));
         case 'editor_eval':
             return await new Function('Editor', 'require', `return (async () => { ${a.code} })()`)(Editor, require);
-        case 'scene_eval':
-            return await Editor.Message.request('scene', 'execute-scene-script', {
-                name: 'cocos-mcp',
-                method: 'run',
-                args: [a.code],
-            });
+        case 'scene_eval': {
+            const runScene = (method, args) =>
+                Editor.Message.request('scene', 'execute-scene-script', { name: 'cocos-mcp', method, args });
+            let out;
+            try {
+                out = await runScene('run', [a.code]);
+            } catch (e) {
+                // Engine objects are circular, and returning one is the most natural first attempt.
+                if (/circular structure/i.test(e.message || '')) {
+                    // Guidance first: the raw circular error dumps a long property chain that buries anything after it.
+                    throw new Error(
+                        'the return value crosses a process boundary and must be JSON-serializable. Node, Component ' +
+                        'and Scene are circular — return plain data instead, e.g. `node.name` or ' +
+                        `\`node.children.map(n => n.name)\`.\n\nOriginal: ${String(e.message).slice(0, 200)}`,
+                    );
+                }
+                throw e;
+            }
+            // undefined is ambiguous: code with no return, or a scene script the editor never registered.
+            // Only the second is a problem, and it is otherwise completely silent.
+            if (out === undefined && (await runScene('ping', []).catch(() => null)) !== 'pong') {
+                throw new Error(
+                    'the scene script is not registered, so every scene_eval silently returns undefined. ' +
+                    'Call the reload tool; if that does not help, reopen the scene in the editor.',
+                );
+            }
+            return out;
+        }
         case 'build': {
             const options = await buildOptions(a.overrides);
             const before = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' });

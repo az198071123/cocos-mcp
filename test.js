@@ -5,6 +5,7 @@ const PORT = process.env.COCOS_MCP_PORT;
 const assert = require('assert');
 let addTaskArgs = null;
 const pkgCalls = [];
+let scenePingAlive = true;
 const FAKE_PNG = Buffer.from('fake png bytes');
 const fs = require('fs'), os = require('os'), path = require('path');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cocos-mcp-'));
@@ -35,7 +36,13 @@ global.Editor = {
     Profile: { getConfig: async () => 'browser' },
     Message: {
         async request(pkg, method, ...args) {
-            if (pkg === 'scene' && method === 'execute-scene-script') return { echoed: args[0] };
+            if (pkg === 'scene' && method === 'execute-scene-script') {
+                const { method: m, args: inner } = args[0];
+                if (m === 'ping') return scenePingAlive ? 'pong' : undefined;
+                if (inner[0] === 'CIRCULAR') throw new Error('Converting circular structure to JSON');
+                if (inner[0] === 'NORETURN') return undefined;
+                return { echoed: args[0] };
+            }
             if (pkg === 'builder' && method === 'query-tasks-info') {
                 return {
                     free: true,
@@ -197,6 +204,24 @@ async function assertPortFree() {
     const badPlat = await (await post({ jsonrpc: '2.0', id: 26, method: 'tools/call', params: { name: 'build', arguments: { overrides: { platform: 'not-a-platform' } } } })).json();
     assert.equal(badPlat.result.isError, true, 'invalid platform must error, not queue');
     assert.match(badPlat.result.content[0].text, /Valid platforms: web-mobile, web-desktop/, 'error must list valid platforms: ' + badPlat.result.content[0].text);
+
+    // a circular return must explain the process boundary, not just echo the raw TypeError
+    const circ = await (await post({ jsonrpc: '2.0', id: 27, method: 'tools/call', params: { name: 'scene_eval', arguments: { code: 'CIRCULAR' } } })).json();
+    assert.equal(circ.result.isError, true);
+    assert.match(circ.result.content[0].text, /JSON-serializable/, 'circular error must say how to fix it');
+
+    // undefined with a live scene script is a legitimate result
+    scenePingAlive = true;
+    const noret = await (await post({ jsonrpc: '2.0', id: 28, method: 'tools/call', params: { name: 'scene_eval', arguments: { code: 'NORETURN' } } })).json();
+    assert.equal(noret.result.isError, undefined, 'plain no-return must not be an error');
+    assert.equal(noret.result.content[0].text, 'undefined');
+
+    // undefined with a dead scene script must stop being silent
+    scenePingAlive = false;
+    const dead = await (await post({ jsonrpc: '2.0', id: 29, method: 'tools/call', params: { name: 'scene_eval', arguments: { code: 'NORETURN' } } })).json();
+    assert.equal(dead.result.isError, true, 'unregistered scene script must surface, not return undefined');
+    assert.match(dead.result.content[0].text, /not registered/);
+    scenePingAlive = true;
 
     // reload must reply BEFORE tearing the server down, then disable/enable this very directory
     const rel = await (await post({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'reload', arguments: {} } })).json();

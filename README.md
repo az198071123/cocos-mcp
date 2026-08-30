@@ -90,6 +90,12 @@ either way. `asset_info` counts those separately as `ghostUsers` instead of sile
 **A zero reference count is not permission to delete.** It only means nothing in *this* checkout references
 it. Five images that looked dead on one branch turned out to be used by another game on a sibling branch.
 
+**`scene_eval` returns must be JSON-serializable, and `undefined` used to be ambiguous.** The value crosses
+a process boundary, so returning a live `Node`/`Component`/`Scene` fails with a circular-structure error —
+return `node.name` or `node.children.map(n => n.name)` instead. And `undefined` means either "your code has
+no return" or "the scene script was never registered", the second being completely silent; `scene_eval` now
+pings the scene script before accepting an `undefined` and tells you to reload if it is dead.
+
 **`@cocos/creator-types` only covers a fraction of the API.** The bundled types declare ~51 `scene`
 messages; the running editor has 200+. `add-task`, `query-preview-url` and many others are declared only
 in each installed package's own `@types` inside `CocosCreator.app`. `editor_api` scans both.
