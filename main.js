@@ -124,6 +124,14 @@ const TOOLS = [
         inputSchema: { type: 'object', properties: {} },
     },
     {
+        name: 'reload',
+        description:
+            'Reload this extension so edits to main.js or scene-script.js take effect. The server drops for ' +
+            'about two seconds and comes back on the same port — just retry your next call. Scene scripts are ' +
+            'require-cached, so editing scene-script.js does nothing until you call this.',
+        inputSchema: { type: 'object', properties: {} },
+    },
+    {
         name: 'editor_api',
         description:
             'Grep the bundled @cocos/creator-types .d.ts for a message name or type, returning its TypeScript ' +
@@ -269,6 +277,19 @@ async function callTool(name, a) {
                 platform: await Editor.Profile.getConfig('preview', 'preview.current.platform', 'default'),
                 connections: await Editor.Message.request('preview', 'query-connect-num'),
             };
+        case 'reload': {
+            // Deferred: disabling this package kills the HTTP server, so the reply has to go out first.
+            setTimeout(async () => {
+                try {
+                    Editor.Package.disable(__dirname);
+                    await new Promise((r) => setTimeout(r, 800));
+                    Editor.Package.enable(__dirname);
+                } catch (e) {
+                    console.error('[cocos-mcp] reload failed', e);
+                }
+            }, 300);
+            return 'reload scheduled — back on this port in ~2s';
+        }
         case 'editor_api':
             return grepTypes(a.query);
     }
@@ -286,7 +307,8 @@ function clip(value) {
     if (text === undefined) text = 'undefined';
     if (text === '') text = '(empty string)';
     return text.length > MAX_CHARS
-        ? `${text.slice(0, MAX_CHARS)}\n...[truncated, ${text.length} chars total — narrow the query]`
+        ? `${text.slice(0, MAX_CHARS)}\n...[truncated, ${text.length} of ${text.length} chars — do not retry as-is. " +
+              "Aggregate inside editor_eval instead: loop the query there and return only the fields you need.]`
         : text;
 }
 

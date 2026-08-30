@@ -4,9 +4,9 @@ An MCP server that runs **inside** the Cocos Creator editor process, so an AI as
 editor the same way you do: query the live scene graph, read and write assets, kick off builds, read the
 log, and look at a screenshot of what it just did.
 
-Nine tools. Zero dependencies. No build step. Tested against Cocos Creator 3.8.8.
+Ten tools. Zero dependencies. No build step. Tested against Cocos Creator 3.8.8.
 
-## Why nine tools and not a hundred
+## Why ten tools and not a hundred
 
 The editor API is huge — `scene` alone declares 200+ messages. Wrapping each one as its own MCP tool means
 a giant tool list permanently occupying the model's context, and a maintenance burden every time Creator
@@ -61,6 +61,7 @@ means the tool names (`mcp__cocos-creator__*`) stay stable wherever you are:
 | `editor_log` | Tails `temp/logs/project.log` with a regex filter |
 | `screenshot` | Captures an editor window as a PNG image block |
 | `preview` | Preview server URL, platform, and connection count |
+| `reload` | Reloads this extension so code edits take effect |
 
 ## Resources
 
@@ -90,20 +91,14 @@ meanings. `build` decodes whichever applies.
 **Build warnings are not in `build_status`.** Its `detailMessage` only carries the last hook name. Real
 warnings and errors go to `temp/logs/project.log` — use `editor_log`.
 
-**Reloading the extension needs a deferred disable/enable**, or the HTTP response dies before it is sent:
+**Reloading needs a deferred disable/enable.** The `reload` tool handles it: it replies *first*, then tears
+the server down 300 ms later — disabling the package kills the HTTP server, so doing it inline loses the
+response. Keep-alive sockets would otherwise hold the port across a reload, so `unload()` destroys them
+explicitly. Scene scripts are require-cached, so editing `scene-script.js` does nothing until you reload.
 
-```js
-// via editor_eval
-const p = Editor.Project.path + '/extensions/cocos-mcp';
-setTimeout(async () => {
-    Editor.Package.disable(p);
-    await new Promise(r => setTimeout(r, 800));
-    Editor.Package.enable(p);
-}, 300);
-return 'scheduled';
-```
-
-Keep-alive sockets otherwise hold the port open across a reload, so `unload()` destroys them explicitly.
+**Large results are truncated at 20 000 chars.** Do not retry a truncated call as-is — `query-assets` on a
+folder blows the cap with a dozen assets. Loop inside `editor_eval` and return only the fields you need;
+the round trips happen inside the editor and cost nothing.
 
 **Driving the running game** is a browser automation job — `preview` just hands over the URL. Two things
 that bite when clicking the canvas from Puppeteer/Playwright:
@@ -130,8 +125,11 @@ canvas.dispatchEvent(new MouseEvent('mouseup',   { ...base, buttons: 0 }));
 Runs offline against a stubbed `Editor` — no editor needed:
 
 ```sh
-COCOS_MCP_PORT=1315 node test.js
+node test.js
 ```
+
+It binds port 19314 and aborts if that is taken, so it can never accidentally run its assertions
+against a live editor. Override with `COCOS_MCP_PORT`.
 
 ## Security
 

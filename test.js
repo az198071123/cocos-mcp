@@ -1,7 +1,10 @@
 // Offline check: stub Editor, run the extension, speak MCP at it.
-const PORT = process.env.COCOS_MCP_PORT || 1314;
+// Default to a port nothing else claims; a live editor on 1314/1315 would otherwise answer for us.
+process.env.COCOS_MCP_PORT = process.env.COCOS_MCP_PORT || '19314';
+const PORT = process.env.COCOS_MCP_PORT;
 const assert = require('assert');
 let addTaskArgs = null;
+const pkgCalls = [];
 const FAKE_PNG = Buffer.from('fake png bytes');
 const fs = require('fs'), os = require('os'), path = require('path');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cocos-mcp-'));
@@ -20,7 +23,7 @@ require('module')._load = ((orig) => function (req, ...rest) {
 })(require('module')._load);
 global.Editor = {
     Project: { path: PROJECT, tmpDir: tmp, name: 'test-project', uuid: 'u1' },
-    Package: { getPackages: () => [] },
+    Package: { getPackages: () => [], disable: (p) => pkgCalls.push(['disable', p]), enable: (p) => pkgCalls.push(['enable', p]) },
     Profile: { getConfig: async () => 'browser' },
     Message: {
         async request(pkg, method, ...args) {
@@ -55,7 +58,19 @@ const post = (body) =>
         body: JSON.stringify(body),
     });
 
+// Abort loudly if the port is taken — otherwise load() fails silently and every assertion below
+// runs against whatever server does answer (a real editor, in the worst case).
+async function assertPortFree() {
+    await new Promise((resolve, reject) => {
+        const probe = require('net').createServer();
+        probe.once('error', (e) => reject(new Error(`port ${PORT} is in use (${e.code}) — set COCOS_MCP_PORT to a free one`)));
+        probe.once('listening', () => probe.close(resolve));
+        probe.listen(PORT, '127.0.0.1');
+    });
+}
+
 (async () => {
+    await assertPortFree();
     ext.load();
     await new Promise((r) => setTimeout(r, 200));
 
@@ -66,7 +81,7 @@ const post = (body) =>
     assert.equal(notif.status, 202, 'notification must get 202, no body');
 
     const list = await (await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).json();
-    assert.equal(list.result.tools.length, 9);
+    assert.equal(list.result.tools.length, 10);
 
     const req = await (await post({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'editor_request', arguments: { pkg: 'scene', method: 'query-node-tree' } } })).json();
     assert.match(req.result.content[0].text, /query-node-tree/);
@@ -126,14 +141,23 @@ const post = (body) =>
     // initialize must advertise resources, or clients never ask for them
     assert.deepEqual(init.result.capabilities, { tools: {}, resources: {} });
 
+    // reload must reply BEFORE tearing the server down, then disable/enable this very directory
+    const rel = await (await post({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'reload', arguments: {} } })).json();
+    assert.match(rel.result.content[0].text, /reload scheduled/);
+    assert.deepEqual(pkgCalls, [], 'reload must not touch the package before replying');
+    await new Promise((r) => setTimeout(r, 1400));
+    assert.deepEqual(pkgCalls.map((c) => c[0]), ['disable', 'enable'], 'reload order wrong: ' + JSON.stringify(pkgCalls));
+    assert.equal(pkgCalls[0][1], __dirname, 'reload must target its own directory, got ' + pkgCalls[0][1]);
+
     // reload must free the port
     ext.unload();
     await new Promise((r) => setTimeout(r, 100));
     ext.load();
     await new Promise((r) => setTimeout(r, 200));
     const again = await (await post({ jsonrpc: '2.0', id: 9, method: 'tools/list' })).json();
-    assert.equal(again.result.tools.length, 9, 'reload leaked the port');
+    assert.equal(again.result.tools.length, 10, 'reload leaked the port');
     ext.unload();
+
 
     // .port is the per-project override; env must still win over it
     // .port may be a real per-project setting — never destroy it.
@@ -146,7 +170,7 @@ const post = (body) =>
         fresh.load();
         await new Promise((r) => setTimeout(r, 200));
         const viaEnv = await (await post({ jsonrpc: '2.0', id: 19, method: 'tools/list' })).json();
-        assert.equal(viaEnv.result.tools.length, 9, 'COCOS_MCP_PORT must outrank .port');
+        assert.equal(viaEnv.result.tools.length, 10, 'COCOS_MCP_PORT must outrank .port');
         fresh.unload();
     } finally {
         if (hadPort === null) fs.unlinkSync(portFile);
