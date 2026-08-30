@@ -136,7 +136,10 @@ const post = (body) =>
     ext.unload();
 
     // .port is the per-project override; env must still win over it
-    fs.writeFileSync(path.join(__dirname, '.port'), '1399\n');
+    // .port may be a real per-project setting — never destroy it.
+    const portFile = path.join(__dirname, '.port');
+    const hadPort = fs.existsSync(portFile) ? fs.readFileSync(portFile, 'utf8') : null;
+    fs.writeFileSync(portFile, '1399\n');
     try {
         delete require.cache[require.resolve('./main.js')];
         const fresh = require('./main.js');
@@ -146,7 +149,8 @@ const post = (body) =>
         assert.equal(viaEnv.result.tools.length, 9, 'COCOS_MCP_PORT must outrank .port');
         fresh.unload();
     } finally {
-        fs.unlinkSync(path.join(__dirname, '.port'));
+        if (hadPort === null) fs.unlinkSync(portFile);
+        else fs.writeFileSync(portFile, hadPort);
     }
 
     console.log('all checks passed');
