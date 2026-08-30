@@ -1,0 +1,11 @@
+{
+  "name": "cocos-mcp",
+  "version": "1.0.0",
+  "package_version": 2,
+  "description": "MCP server running inside the Cocos Creator editor process",
+  "main": "./main.js",
+  "editor": ">=3.8.0",
+  "contributions": {
+    "scene": { "script": "./scene-script.js" }
+  }
+}
