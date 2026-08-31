@@ -299,6 +299,30 @@ async function assertPortFree() {
     const badVer = await (await post({ jsonrpc: '2.0', id: 94, method: 'initialize', params: { protocolVersion: '1999-01-01' } })).json();
     assert.equal(badVer.result.protocolVersion, '2025-06-18', 'an unknown version must not be echoed back');
 
+    // MCP-Protocol-Version: unsupported MUST be 400, supported and absent must both pass
+    const verBad = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'mcp-protocol-version': 'not-a-version' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 95, method: 'tools/list' }),
+    });
+    assert.equal(verBad.status, 400, 'an unsupported protocol version must be refused');
+    assert.match(await verBad.text(), /unsupported MCP-Protocol-Version/);
+
+    const verOk = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'mcp-protocol-version': '2025-06-18' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 96, method: 'tools/list' }),
+    });
+    assert.equal(verOk.status, 200);
+
+    // Absent header must NOT be an error — the spec says assume 2025-03-26
+    const verNone = await (await post({ jsonrpc: '2.0', id: 97, method: 'tools/list' })).json();
+    assert.ok(verNone.result.tools.length > 0, 'a missing version header must still be served');
+
+    // GET is the SSE stream the spec makes optional; 405 is the allowed answer when absent
+    const get = await fetch(`http://127.0.0.1:${PORT}/mcp`, { method: 'GET', headers: { accept: 'text/event-stream' } });
+    assert.equal(get.status, 405);
+
     // reload must reply BEFORE tearing the server down, then disable/enable this very directory
     const rel = await (await post({ jsonrpc: '2.0', id: 20, method: 'tools/call', params: { name: 'reload', arguments: {} } })).json();
     assert.match(rel.result.content[0].text, /reload scheduled/);

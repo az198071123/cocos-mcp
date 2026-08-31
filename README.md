@@ -1,6 +1,6 @@
 # cocos-mcp
 
-An MCP server that runs **inside** the Cocos Creator editor process, so an AI assistant can drive the
+A Streamable HTTP MCP server that runs **inside** the Cocos Creator editor process, so an AI assistant can drive the
 editor the same way you do: query the live scene graph, read and write assets, kick off builds, read the
 log, and look at a screenshot of what it just did.
 
@@ -49,6 +49,26 @@ means the tool names (`mcp__cocos-creator__*`) stay stable wherever you are:
     "/path/to/project-b": { "mcpServers": { "cocos-creator": { "type": "http", "url": "http://127.0.0.1:1315/mcp" } } }
 } }
 ```
+
+### Transport
+
+Streamable HTTP (MCP spec 2025-03-26 and later), which replaced the two-endpoint HTTP+SSE transport from
+2024-11-05. One endpoint; POST returns `application/json` — the spec makes the SSE stream optional, and a
+single JSON object is the other allowed answer. GET returns 405, which is what the spec prescribes for a
+server that offers no stream.
+
+| Request | Response | Spec |
+| --- | --- | --- |
+| `POST` a request | `200 application/json` | server MUST return either this or `text/event-stream` |
+| `POST` a notification (no `id`) | `202`, empty body | required |
+| `GET` | `405` | allowed when the server offers no SSE stream |
+| unsupported `MCP-Protocol-Version` | `400` | required |
+| no `MCP-Protocol-Version` | served, assumed `2025-03-26` | required |
+| any request carrying `Origin` | `403` | Origin validation is required — see Security |
+
+SSE would only earn its place if the server needed to push without being asked. Build progress is polled
+through `build_status` instead, which is simpler and enough. The one case that would benefit is
+`build` with `wait: true`, which currently blocks for the whole build.
 
 ## Tools
 
@@ -189,6 +209,10 @@ against a live editor. Override with `COCOS_MCP_PORT`.
 
 `editor_eval` and `scene_eval` execute arbitrary code with full editor privileges, so the server has to
 assume any request could be hostile.
+
+The spec is explicit about which of these is which: validating `Origin` is a **MUST**, binding to
+localhost is only a **SHOULD**. This server originally did the SHOULD and skipped the MUST — and said so
+in this very section, as if the SHOULD were the guarantee.
 
 **Binding to `127.0.0.1` is not enough, and believing otherwise was a real hole here.** A page the
 developer visits while Creator is open can POST to a loopback port: `text/plain` makes it a CORS *simple

@@ -555,6 +555,15 @@ function onRequest(req, res) {
         res.end('origin not allowed\n');
         return;
     }
+    // Spec: an invalid or unsupported MCP-Protocol-Version MUST get 400. A missing header is
+    // fine — the spec says to assume 2025-03-26 in that case.
+    const version = req.headers['mcp-protocol-version'];
+    if (version && !SUPPORTED_PROTOCOLS.includes(version)) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end(`unsupported MCP-Protocol-Version "${version}" — supported: ${SUPPORTED_PROTOCOLS.join(', ')}\n`);
+        return;
+    }
+    // GET would open an SSE stream; the spec allows 405 when the server does not offer one.
     if (req.method !== 'POST') {
         res.writeHead(405).end();
         return;
