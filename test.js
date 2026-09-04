@@ -31,6 +31,32 @@ require('module')._load = ((orig) => function (req, ...rest) {
     }
     return orig.call(this, req, ...rest);
 })(require('module')._load);
+// A prefab on disk that save-asset really rewrites, so an append that corrupts the file, loses an
+// override, or fails to roll back is caught rather than assumed.
+const PREFAB_FILE = path.join(tmp, 'Panel.prefab');
+const PREFAB_URL = 'db://assets/op6/Panel.prefab';
+const PREFAB_UUID = 'P-PREFAB';
+// How many components the fake engine reports back; the tool compares this against the file.
+let instantiateComponents = null;
+let sceneMode = 'general';
+let sceneDirty = true;
+let openSceneUuid = 'OTHER-SCENE';
+const resetPrefab = () => {
+    const doc = [
+        { __type__: 'cc.Prefab', _name: 'Panel', data: { __id__: 1 } },
+        { __type__: 'cc.Node', _name: 'Panel', _components: [{ __id__: 2 }], _prefab: { __id__: 4 } },
+        { __type__: 'cc.UITransform', node: { __id__: 1 }, __prefab: { __id__: 3 } },
+        { __type__: 'cc.CompPrefabInfo', fileId: 'existingFileId00000000' },
+        { __type__: 'cc.PrefabInfo', fileId: 'rootFileId000000000000' },
+        { __type__: 'CCPropertyOverrideInfo', propertyPath: ['_lpos'] },
+        { __type__: 'cc.TargetInfo', localID: ['abc'] },
+    ];
+    // Cocos's own formatting: two-space indent, no trailing newline.
+    fs.writeFileSync(PREFAB_FILE, JSON.stringify(doc, null, 2));
+    instantiateComponents = ['UITransform', 'MoveInOnEnable'];
+};
+resetPrefab();
+
 // A live node the set-property stub actually mutates. A stub that echoed the request back
 // would let a set_property that never writes anything pass every assertion below.
 let sceneNode = null;
@@ -60,7 +86,21 @@ global.Editor = {
                 if (m === 'ping') return scenePingAlive ? 'pong' : undefined;
                 if (inner[0] === 'CIRCULAR') throw new Error('Converting circular structure to JSON');
                 if (inner[0] === 'NORETURN') return undefined;
+                // Stands in for the engine deserializing the prefab; a component whose script fails
+                // to resolve is simply absent from this list, which is what the tool checks for.
+                if (String(inner[0]).includes('cc.instantiate')) {
+                    if (instantiateComponents === 'THROW') throw new Error('Cannot read property of undefined');
+                    return { components: instantiateComponents, children: 0 };
+                }
                 return { echoed: args[0] };
+            }
+            if (pkg === 'scene' && method === 'query-dirty') return sceneDirty;
+            if (pkg === 'scene' && method === 'query-scene-mode') return sceneMode;
+            if (pkg === 'scene' && method === 'query-current-scene') return openSceneUuid;
+            if (pkg === 'scene' && method === 'save-scene') { sceneDirty = false; return 'saved'; }
+            if (pkg === 'asset-db' && method === 'save-asset') {
+                fs.writeFileSync(PREFAB_FILE, args[1]);
+                return { url: PREFAB_URL, uuid: PREFAB_UUID, file: PREFAB_FILE, importer: 'prefab' };
             }
             if (pkg === 'scene' && method === 'query-node') return args[0] === 'N1' ? sceneNode : null;
             if (pkg === 'scene' && method === 'snapshot') { snapshots += 1; return undefined; }
@@ -104,6 +144,10 @@ global.Editor = {
             if (pkg === 'builder' && method === 'add-task') { addTaskArgs = args; return args[1] ? 36 : 1; }
             if (pkg === 'asset-db' && method === 'query-asset-info') {
                 const t = args[0];
+                if (t === PREFAB_URL || t === PREFAB_UUID) {
+                    return { url: PREFAB_URL, uuid: PREFAB_UUID, file: PREFAB_FILE, importer: 'prefab', source: PREFAB_URL };
+                }
+                if (t === 'OTHER-SCENE') return { url: 'db://assets/a.scene', uuid: 'OTHER-SCENE', file: PREFAB_FILE, importer: 'scene' };
                 if (t === 'db://assets/x.png' || t === 'U-IMG') {
                     return { source: 'db://assets/x.png', uuid: 'U-IMG', importer: 'image', file: __filename };
                 }
@@ -158,7 +202,7 @@ async function assertPortFree() {
     assert.equal(notif.status, 202, 'notification must get 202, no body');
 
     const list = await (await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).json();
-    assert.equal(list.result.tools.length, 12);
+    assert.equal(list.result.tools.length, 14);
 
     // set_property: the four outcomes, against a stub whose set-property always claims success
     {
@@ -201,6 +245,83 @@ async function assertPortFree() {
 
         const stale = await set({ uuid: 'GONE', path: 'position.x', dump: { type: 'Number', value: 1 } });
         assert.match(stale.text, /no such node: GONE/);
+    }
+
+    // save: which file, and how much of it actually moved
+    {
+        let id = 940;
+        const save = async (args = {}) => {
+            const r = await (await post({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name: 'save', arguments: args } })).json();
+            return r.result.isError ? { isError: true, text: r.result.content[0].text } : JSON.parse(r.result.content[0].text);
+        };
+        resetPrefab();
+        sceneDirty = true;
+        const saved = await save();
+        assert.equal(saved.saved, true);
+        assert.equal(saved.file, PREFAB_FILE, 'must name the file to diff, not just report success');
+        assert.equal(saved.fileDelta.contentChanged, false, 'save-scene wrote nothing here, and that must be visible');
+
+        const clean = await save();
+        assert.equal(clean.saved, false, 'a clean editor must not be saved again');
+        assert.match(clean.note, /no unsaved changes/);
+    }
+
+    // prefab_add_component: append to the file, verify through the engine, roll back if it lies
+    {
+        let id = 960;
+        const add = async (args) => {
+            const r = await (await post({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name: 'prefab_add_component', arguments: args } })).json();
+            return r.result.isError ? { isError: true, text: r.result.content[0].text } : JSON.parse(r.result.content[0].text);
+        };
+        resetPrefab();
+        const originalText = fs.readFileSync(PREFAB_FILE, 'utf8');
+
+        const ok = await add({ target: PREFAB_URL, type: 'a4f2d44d-f78f-4fcb-bc21-0dc0c1b7e2d8', props: { duration: 0.2, easing: 5 } });
+        // The compressed form is what a prefab actually stores; this exact string was read out of
+        // a real prefab that the editor wrote, so it pins the algorithm to observed output.
+        assert.equal(ok.type, 'a4f2dRN949Py7whDcDBt+LY');
+        assert.equal(ok.verified, true);
+        assert.equal(ok.overridesLost, 0, 'appending must not cost a single override');
+        assert.equal(ok.overridesAfter.CCPropertyOverrideInfo, ok.overridesBefore.CCPropertyOverrideInfo);
+
+        const written = fs.readFileSync(PREFAB_FILE, 'utf8');
+        const doc = JSON.parse(written);
+        const originalDoc = JSON.parse(originalText);
+        // Everything that was already in the file must survive untouched. The one exception is the
+        // target node's own _components list, which is the point of the operation. Anything else
+        // moving means entries were renumbered, and that is what makes an editor diff unreadable.
+        originalDoc.forEach((entry, i) => {
+            if (i === 1) return;
+            assert.deepEqual(doc[i], entry, `entry ${i} must not change`);
+        });
+        assert.deepEqual({ ...doc[1], _components: undefined }, { ...originalDoc[1], _components: undefined },
+            'the target node must change only in its component list');
+        // Cocos writes no trailing newline; adding one would reflow nothing but still dirty the file.
+        assert.ok(!written.endsWith('\n'), 'must match Cocos formatting exactly, including the missing final newline');
+        assert.equal(doc.length, 9, 'one component plus one CompPrefabInfo');
+        assert.deepEqual(doc[1]._components, [{ __id__: 2 }, { __id__: 7 }], 'appended, so no existing __id__ moved');
+        assert.equal(doc[7].__prefab.__id__, 8);
+        assert.notEqual(doc[8].fileId, doc[3].fileId, 'a colliding fileId would break the prefab');
+
+        const dupe = await add({ target: PREFAB_URL, type: 'a4f2d44d-f78f-4fcb-bc21-0dc0c1b7e2d8' });
+        assert.match(dupe.text, /already has/);
+
+        // The rollback path: the engine builds the prefab without the component, so the write is
+        // a silent failure and the file must go back exactly as it was.
+        resetPrefab();
+        const before = fs.readFileSync(PREFAB_FILE, 'utf8');
+        instantiateComponents = ['UITransform'];      // the new component did not come back
+        const bad = await add({ target: PREFAB_URL, type: 'cc.BlockInputEvents' });
+        assert.ok(bad.isError, 'a component the engine cannot build must not be reported as added');
+        assert.match(bad.text, /file was restored/);
+        assert.equal(fs.readFileSync(PREFAB_FILE, 'utf8'), before, 'the file must be byte-identical after a rollback');
+
+        // Refuses to race the editor over the same asset.
+        resetPrefab();
+        openSceneUuid = PREFAB_UUID;
+        const open = await add({ target: PREFAB_URL, type: 'cc.BlockInputEvents' });
+        assert.match(open.text, /open in the editor/);
+        openSceneUuid = 'OTHER-SCENE';
     }
 
     const req = await (await post({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'editor_request', arguments: { pkg: 'scene', method: 'query-node-tree' } } })).json();
@@ -418,7 +539,7 @@ async function assertPortFree() {
     ext.load();
     await new Promise((r) => setTimeout(r, 200));
     const again = await (await post({ jsonrpc: '2.0', id: 9, method: 'tools/list' })).json();
-    assert.equal(again.result.tools.length, 12, 'reload leaked the port');
+    assert.equal(again.result.tools.length, 14, 'reload leaked the port');
     ext.unload();
 
 
@@ -433,7 +554,7 @@ async function assertPortFree() {
         fresh.load();
         await new Promise((r) => setTimeout(r, 200));
         const viaEnv = await (await post({ jsonrpc: '2.0', id: 19, method: 'tools/list' })).json();
-        assert.equal(viaEnv.result.tools.length, 12, 'COCOS_MCP_PORT must outrank .port');
+        assert.equal(viaEnv.result.tools.length, 14, 'COCOS_MCP_PORT must outrank .port');
         fresh.unload();
     } finally {
         if (hadPort === null) fs.unlinkSync(portFile);

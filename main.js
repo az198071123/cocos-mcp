@@ -7,6 +7,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // One editor per port: a second Creator instance needs its own, or it loses the race for 1314.
 // Precedence: COCOS_MCP_PORT env > a `.port` file next to this one (gitignored) > 1314.
@@ -28,6 +29,28 @@ function resolvePort() {
 }
 const PORT = resolvePort();
 const MAX_CHARS = 20000;
+const REQUEST_TIMEOUT_MS = 30000;
+
+// Every editor call goes through here. Some requests neither resolve nor reject: a native modal
+// (the "save changes?" prompt when switching assets) blocks the scene channel, and that dialog is
+// outside the web contents, so it cannot be seen or screenshotted from here. Without a timeout the
+// await never returns, every later call queues behind it, and the server just looks dead. This
+// cannot rescue the editor — the request is still hanging inside it — but it turns an infinite
+// hang into a message that says where to look.
+function request(pkg, method, ...args) {
+    let timer = null;
+    return Promise.race([
+        Promise.resolve(Editor.Message.request(pkg, method, ...args)).finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(
+                `${pkg}:${method} did not answer within ${REQUEST_TIMEOUT_MS}ms. Look at the editor window ` +
+                'first — the usual cause is a native dialog waiting to be clicked, which blocks the whole ' +
+                'scene channel and is invisible to this server. If there is no dialog, the editor is wedged ' +
+                'and only a restart clears it.',
+            )), REQUEST_TIMEOUT_MS);
+        }),
+    ]);
+}
 
 let server = null;
 const sockets = new Set();
@@ -90,6 +113,38 @@ const TOOLS = [
                 dump: { type: 'object', description: 'the value wrapper, e.g. {"type":"Boolean","value":false}' },
             },
             required: ['uuid', 'path', 'dump'],
+        },
+    },
+    {
+        name: 'save',
+        description:
+            'Save the open scene or prefab, and say what it actually wrote: which file on disk, and the ' +
+            'before/after byte, line and sha1 comparison. save-scene on its own tells you neither, and "which ' +
+            'file" is not obvious in prefab edit mode. contentChanged false means the save wrote nothing. ' +
+            'Benchmark: an untouched prefab saves as a 0-line diff, so any line movement is something real.',
+        inputSchema: {
+            type: 'object',
+            properties: { force: { type: 'boolean', description: 'save even when the editor reports no unsaved changes' } },
+        },
+    },
+    {
+        name: 'prefab_add_component',
+        description:
+            'Add a component to a prefab by editing the asset file, without ever opening it in the editor. ' +
+            'Opening a prefab whose nested instances are stale makes the editor resync them and silently drop ' +
+            'their CCPropertyOverrideInfo/cc.TargetInfo overrides — thousands of diff lines and a layout that ' +
+            'moves. This appends to the end of the file instead, so no existing __id__ is renumbered: about 35 ' +
+            'added lines, no deletions, override counts unchanged. The result is verified by instantiating the ' +
+            'prefab through the engine, and the file is restored if the component does not come back.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                target: { type: 'string', description: 'db://assets/... url, or the prefab uuid' },
+                type: { type: 'string', description: 'engine type ("cc.BlockInputEvents") or a script uuid from its .meta ("a4f2d44d-..."), which is compressed for you' },
+                nodeId: { type: 'number', description: '__id__ of the node to attach to; default 1, the root' },
+                props: { type: 'object', description: 'serialized property values, e.g. {"duration":0.2,"easing":5}' },
+            },
+            required: ['target', 'type'],
         },
     },
     {
@@ -250,7 +305,7 @@ async function buildOptions(overrides) {
     const o = Object.assign({}, overrides);
     // check-and-complete-options needs a platform to look its config up; everything else it fills in.
     if (!o.platform) {
-        const info = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' }).catch(() => null);
+        const info = await request('builder', 'query-tasks-info', { type: 'build' }).catch(() => null);
         // The list runs newest-first, but aborted tasks sink to the end — sort by id (a
         // creation timestamp) rather than trusting the order. .pop() picked the OLDEST build.
         const last = info && newestTask((info.list || []).filter((t) => t.options && t.options.platform));
@@ -263,9 +318,9 @@ async function buildOptions(overrides) {
     try {
         // The builder validates and completes far better than merging a previous task's options by hand:
         // it fills every required field, follows taskName to outputName, and swaps platform-specific packages.
-        return await Editor.Message.request('builder', 'check-and-complete-options', o);
+        return await request('builder', 'check-and-complete-options', o);
     } catch (e) {
-        const cfg = await Editor.Message.request('builder', 'query-platform-config').catch(() => null);
+        const cfg = await request('builder', 'query-platform-config').catch(() => null);
         const valid = cfg && cfg.order ? ` Valid platforms: ${cfg.order.join(', ')}.` : '';
         // Without this, add-task happily queues bad options and only says "参数校验失败" once the task fails,
         // with an empty detailMessage — so validate up front instead.
@@ -362,15 +417,56 @@ function resolveComponentPath(dump, path) {
     return { path: `${PREFIX}${hits[0]}.${prop}`, resolvedFrom: path };
 }
 
+const BASE64_KEYS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+// A prefab stores a script component's type as Cocos's compressed uuid, which is why grepping a
+// prefab for the uuid out of a .meta finds nothing. Keep the first five characters, then recode
+// the remaining 27 hex digits three at a time: each 12 bits become two base64 characters.
+function compressUuid(uuid) {
+    const hex = String(uuid).replace(/-/g, '');
+    if (!/^[0-9a-fA-F]{32}$/.test(hex)) throw new Error(`not a uuid: ${uuid}`);
+    let out = hex.slice(0, 5);
+    for (let i = 5; i < 32; i += 3) {
+        const n = parseInt(hex.slice(i, i + 3), 16);
+        out += BASE64_KEYS[n >> 6] + BASE64_KEYS[n & 63];
+    }
+    return out;
+}
+
+// Every component in a prefab carries a cc.CompPrefabInfo whose fileId must be unique in the file.
+function randomFileId() {
+    let s = '';
+    for (let i = 0; i < 22; i += 1) s += BASE64_KEYS[crypto.randomInt(64)];
+    return s;
+}
+
+// Saving says nothing about which file it wrote or how much moved. Measuring both sides turns
+// "saved" into a number to compare against the diff you expected.
+function fingerprint(file) {
+    if (!file) return null;
+    try {
+        const buf = fs.readFileSync(file);
+        let lines = 0;
+        for (const b of buf) if (b === 0x0a) lines += 1;
+        return { bytes: buf.length, lines, sha1: crypto.createHash('sha1').update(buf).digest('hex') };
+    } catch (e) {
+        return null;
+    }
+}
+
+function countTypes(doc, type) {
+    return doc.filter((e) => e && e.__type__ === type).length;
+}
+
 async function callTool(name, a) {
     switch (name) {
         case 'editor_request':
-            return await Editor.Message.request(a.pkg, a.method, ...(a.args || []));
+            return await request(a.pkg, a.method, ...(a.args || []));
         case 'editor_eval':
             return await new Function('Editor', 'require', `return (async () => { ${a.code} })()`)(Editor, require);
         case 'scene_eval': {
             const runScene = (method, args) =>
-                Editor.Message.request('scene', 'execute-scene-script', { name: 'cocos-mcp', method, args });
+                request('scene', 'execute-scene-script', { name: 'cocos-mcp', method, args });
             let out;
             try {
                 out = await runScene('run', [a.code]);
@@ -397,21 +493,21 @@ async function callTool(name, a) {
             return out;
         }
         case 'set_property': {
-            const beforeDump = await Editor.Message.request('scene', 'query-node', a.uuid);
+            const beforeDump = await request('scene', 'query-node', a.uuid);
             // A stale uuid (every one in a prefab goes stale when it reloads) returns nothing
             // here, and set-property on it is a silent no-op. Fail before writing instead.
             if (!beforeDump) throw new Error(`no such node: ${a.uuid} — uuids go stale when a prefab reloads; re-query the tree`);
             const { path, resolvedFrom } = resolveComponentPath(beforeDump, a.path);
             const before = readByPath(beforeDump, path);
-            const returned = await Editor.Message.request('scene', 'set-property', { uuid: a.uuid, path, dump: a.dump });
-            const after = readByPath(await Editor.Message.request('scene', 'query-node', a.uuid), path);
+            const returned = await request('scene', 'set-property', { uuid: a.uuid, path, dump: a.dump });
+            const after = readByPath(await request('scene', 'query-node', a.uuid), path);
             const changed = JSON.stringify(before) !== JSON.stringify(after);
             // Not writing and writing-the-same-value are both "unchanged" but mean opposite
             // things: only one of them needs fixing. Split them on whether the path reads at all.
             const pathMissing = before === undefined && after === undefined;
             // Snapshot only on a real change: it is also what marks the scene dirty, so an
             // unconditional one leaves a * in the title for a write that did nothing.
-            if (changed) await Editor.Message.request('scene', 'snapshot');
+            if (changed) await request('scene', 'snapshot');
             return {
                 path,
                 resolvedFrom,
@@ -428,12 +524,136 @@ async function callTool(name, a) {
                         : 'the value was already this; nothing changed and the scene was not marked dirty'),
             };
         }
+        case 'save': {
+            const mode = await request('scene', 'query-scene-mode').catch(() => null);
+            const openUuid = await request('scene', 'query-current-scene').catch(() => null);
+            const info = openUuid ? await request('asset-db', 'query-asset-info', openUuid).catch(() => null) : null;
+            const file = info && info.file;
+            const dirtyBefore = await request('scene', 'query-dirty');
+            if (!dirtyBefore && !a.force) {
+                return { saved: false, mode, asset: info && info.url, file, note: 'the editor reports no unsaved changes' };
+            }
+            const before = fingerprint(file);
+            await request('scene', 'save-scene');
+            const dirtyAfter = await request('scene', 'query-dirty');
+            const after = fingerprint(file);
+            // Equal byte counts do not mean equal content, so compare the hash rather than the size.
+            const contentChanged = before && after ? before.sha1 !== after.sha1 : null;
+            return {
+                saved: !dirtyAfter,
+                mode,
+                asset: info && info.url,
+                file,
+                editorDirty: !!dirtyAfter,
+                fileDelta: before && after
+                    ? { contentChanged, bytesBefore: before.bytes, bytesAfter: after.bytes, linesBefore: before.lines, linesAfter: after.lines, deltaLines: after.lines - before.lines }
+                    : null,
+                note: !file
+                    ? 'saved, but the open asset could not be resolved to a file, so nothing was measured — find it before diffing'
+                    : (contentChanged
+                        ? `wrote ${file} — diff it now. An untouched prefab saves as a 0-line diff, so every changed line is something that was really written.`
+                        : 'the file on disk is byte-identical to before; this save wrote nothing'),
+            };
+        }
+        case 'prefab_add_component': {
+            const info = await request('asset-db', 'query-asset-info', a.target);
+            if (!info) throw new Error(`no such asset: ${a.target}`);
+            if (info.importer !== 'prefab') throw new Error(`${info.url} is a ${info.importer}, not a prefab`);
+            // The point of editing the file is to never open the prefab: opening a prefab whose
+            // nested instances are stale makes the editor resync them and drop their property
+            // overrides. If it is already open, its in-memory copy wins on the next save and would
+            // silently discard this write, so refuse instead of racing it.
+            const openUuid = await request('scene', 'query-current-scene').catch(() => null);
+            if (openUuid && openUuid === info.uuid) {
+                throw new Error(`${info.url} is open in the editor — close it first, or the editor's copy will overwrite this`);
+            }
+            const original = fs.readFileSync(info.file, 'utf8');
+            const doc = JSON.parse(original);
+            const nodeId = a.nodeId === undefined ? 1 : a.nodeId;
+            const node = doc[nodeId];
+            if (!node || node.__type__ !== 'cc.Node') throw new Error(`__id__ ${nodeId} is not a cc.Node in ${info.url}`);
+            const type = /^[0-9a-fA-F]{8}-/.test(a.type) ? compressUuid(a.type) : a.type;
+            const existing = (node._components || []).map((r) => (doc[r.__id__] || {}).__type__);
+            if (existing.includes(type)) throw new Error(`${node._name} already has ${a.type} (${type})`);
+
+            const beforeCounts = {
+                CCPropertyOverrideInfo: countTypes(doc, 'CCPropertyOverrideInfo'),
+                'cc.TargetInfo': countTypes(doc, 'cc.TargetInfo'),
+                entries: doc.length,
+            };
+            const used = new Set(doc.filter((e) => e && e.fileId).map((e) => e.fileId));
+            let fileId = randomFileId();
+            while (used.has(fileId)) fileId = randomFileId();
+
+            // Appending keeps every existing __id__ where it is. Inserting anywhere else renumbers
+            // the rest of the file, which is most of what makes an editor-written diff unreadable.
+            const compId = doc.length;
+            doc.push(Object.assign(
+                { __type__: type, _name: '', _objFlags: 0, __editorExtras__: {}, node: { __id__: nodeId }, _enabled: true, __prefab: { __id__: compId + 1 } },
+                a.props || {},
+                { _id: '' },
+            ));
+            doc.push({ __type__: 'cc.CompPrefabInfo', fileId });
+            node._components = (node._components || []).concat([{ __id__: compId }]);
+
+            // Cocos serializes prefabs as JSON.stringify(doc, null, 2) with no trailing newline.
+            // Matching it byte for byte is what keeps the diff to the lines actually added; any
+            // other formatting reflows the whole file and buries the change.
+            await request('asset-db', 'save-asset', info.url, JSON.stringify(doc, null, 2));
+
+            const expected = node._components.length;
+            let verified = null;
+            let components = null;
+            let failure = null;
+            try {
+                // The engine's own deserializer is the only witness that matters: a component whose
+                // script fails to resolve simply does not appear, with nothing logged.
+                const out = await callTool('scene_eval', {
+                    code: `const asset = await new Promise((res, rej) => cc.assetManager.loadAny([{ uuid: ${JSON.stringify(info.uuid)}, type: cc.Prefab }], (e, r) => e ? rej(e) : res(r)));
+                           const n = cc.instantiate(asset);
+                           const out = { components: n.components.map((c) => c.constructor.name), children: n.children.length };
+                           n.destroy();
+                           return out;`,
+                });
+                components = out && out.components;
+                verified = nodeId === 1 ? Array.isArray(components) && components.length === expected : Array.isArray(components);
+            } catch (e) {
+                failure = String((e && e.message) || e);
+            }
+            if (!verified) {
+                await request('asset-db', 'save-asset', info.url, original);
+                throw new Error(
+                    `the prefab did not come back with the component, so the file was restored. ${failure || `expected ${expected} components on the root, the engine built ${components ? components.length : 'none'}: ${JSON.stringify(components)}`}`,
+                );
+            }
+            const afterCounts = {
+                CCPropertyOverrideInfo: countTypes(doc, 'CCPropertyOverrideInfo'),
+                'cc.TargetInfo': countTypes(doc, 'cc.TargetInfo'),
+                entries: doc.length,
+            };
+            return {
+                asset: info.url,
+                file: info.file,
+                node: node._name,
+                type,
+                typeFrom: type === a.type ? undefined : a.type,
+                fileId,
+                verified: true,
+                rootComponents: nodeId === 1 ? components : undefined,
+                verifiedScope: nodeId === 1 ? 'root component list' : 'prefab deserializes; per-node check only covers the root',
+                overridesBefore: beforeCounts,
+                overridesAfter: afterCounts,
+                overridesLost: beforeCounts.CCPropertyOverrideInfo - afterCounts.CCPropertyOverrideInfo,
+                note: 'written straight to the file and re-imported; the prefab was never opened, so no nested instances were resynced. git diff it — the change should be about 35 lines with no deletions.',
+            };
+        }
         case 'build': {
             const options = await buildOptions(a.overrides);
-            const before = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' });
+            const before = await request('builder', 'query-tasks-info', { type: 'build' });
             const known = new Set((before.list || []).map((t) => t.id));
+            // Raw, not request(): with wait:true this blocks for the whole build, which is the point.
             const code = await Editor.Message.request('builder', 'add-task', options, !!a.wait);
-            const after = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' });
+            const after = await request('builder', 'query-tasks-info', { type: 'build' });
             const task = (after.list || []).filter((t) => !known.has(t.id)).pop() || (after.list || []).pop();
             // add-task returns SUCCESS even when another build is already running; the new task just sits
             // there with "build task is busy". info.free stays true in that state, so it cannot be used —
@@ -450,8 +670,8 @@ async function callTool(name, a) {
             };
         }
         case 'build_status': {
-            if (a.id) return taskBrief(await Editor.Message.request('builder', 'query-task', a.id));
-            const info = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' });
+            if (a.id) return taskBrief(await request('builder', 'query-task', a.id));
+            const info = await request('builder', 'query-tasks-info', { type: 'build' });
             // info.queue is an id->task record of every task, not a pending queue — `free` is the busy flag.
             return { free: info.free, tasks: (info.list || []).map(taskBrief) };
         }
@@ -478,10 +698,10 @@ async function callTool(name, a) {
         }
         case 'preview':
             return {
-                url: await Editor.Message.request('preview', 'query-preview-url'),
-                ip: await Editor.Message.request('preview', 'get-preview-ip'),
+                url: await request('preview', 'query-preview-url'),
+                ip: await request('preview', 'get-preview-ip'),
                 platform: await Editor.Profile.getConfig('preview', 'preview.current.platform', 'default'),
-                connections: await Editor.Message.request('preview', 'query-connect-num'),
+                connections: await request('preview', 'query-connect-num'),
             };
         case 'reload': {
             // Deferred: disabling this package kills the HTTP server, so the reply has to go out first.
@@ -497,15 +717,15 @@ async function callTool(name, a) {
             return 'reload scheduled — back on this port in ~2s';
         }
         case 'asset_info': {
-            const info = await Editor.Message.request('asset-db', 'query-asset-info', a.target);
+            const info = await request('asset-db', 'query-asset-info', a.target);
             if (!info) throw new Error(`no such asset: ${a.target}`);
             const [users, deps, meta] = await Promise.all([
-                Editor.Message.request('asset-db', 'query-asset-users', info.uuid).catch(() => []),
-                Editor.Message.request('asset-db', 'query-asset-dependencies', info.uuid).catch(() => []),
-                Editor.Message.request('asset-db', 'query-asset-meta', info.uuid).catch(() => null),
+                request('asset-db', 'query-asset-users', info.uuid).catch(() => []),
+                request('asset-db', 'query-asset-dependencies', info.uuid).catch(() => []),
+                request('asset-db', 'query-asset-meta', info.uuid).catch(() => null),
             ]);
             const resolved = await Promise.all(
-                (users || []).map((u) => Editor.Message.request('asset-db', 'query-asset-info', u).catch(() => null)),
+                (users || []).map((u) => request('asset-db', 'query-asset-info', u).catch(() => null)),
             );
             const paths = resolved.filter(Boolean).map((ui) => ui.source);
             const ghosts = resolved.length - paths.length;
@@ -525,7 +745,7 @@ async function callTool(name, a) {
             let source = info.source;
             if (!source && String(a.target).includes('@')) {
                 const [parentUuid, sub] = String(a.target).split('@');
-                const parent = await Editor.Message.request('asset-db', 'query-asset-info', parentUuid).catch(() => null);
+                const parent = await request('asset-db', 'query-asset-info', parentUuid).catch(() => null);
                 if (parent) source = `${parent.source}@${sub}`;
             }
             const subMetas = (meta && meta.subMetas) || {};
@@ -581,7 +801,7 @@ async function readResource(uri) {
                 name: Editor.Project.name,
                 path: Editor.Project.path,
                 uuid: Editor.Project.uuid,
-                previewUrl: await Editor.Message.request('preview', 'query-preview-url'),
+                previewUrl: await request('preview', 'query-preview-url'),
                 platform: await Editor.Profile.getConfig('preview', 'preview.current.platform', 'default'),
             };
         case 'cocos://scene/active':
@@ -591,7 +811,7 @@ async function readResource(uri) {
                       "return { scene: s.name, nodes: walk(s) };",
             });
         case 'cocos://build/latest': {
-            const info = await Editor.Message.request('builder', 'query-tasks-info', { type: 'build' });
+            const info = await request('builder', 'query-tasks-info', { type: 'build' });
             const last = newestTask(info.list || []);
             return { free: info.free, latest: last ? taskBrief(last) : null };
         }
