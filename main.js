@@ -549,6 +549,7 @@ function countComponents(tree) {
 const FIGMA_OVERFLOW = { WIDTH_AND_HEIGHT: 0, TRUNCATE: 1, NONE: 1, HEIGHT: 3 };
 const H_ALIGN = { LEFT: 0, CENTER: 1, RIGHT: 2, JUSTIFIED: 0 };
 const V_ALIGN = { TOP: 0, CENTER: 1, BOTTOM: 2 };
+const LAYOUT_TYPE = { HORIZONTAL: 1, VERTICAL: 2 };
 
 function hexToColor(hex) {
     const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})?$/i.exec(String(hex || ''));
@@ -598,6 +599,41 @@ function figmaNodeToSpec(n) {
         if (H_ALIGN[n.horizontalAlign] !== undefined) set('horizontalAlign', { type: 'Enum', value: H_ALIGN[n.horizontalAlign] });
         if (V_ALIGN[n.verticalAlign] !== undefined) set('verticalAlign', { type: 'Enum', value: V_ALIGN[n.verticalAlign] });
         if (FIGMA_OVERFLOW[n.overflow] !== undefined) set('overflow', { type: 'Enum', value: FIGMA_OVERFLOW[n.overflow] });
+        // These go on cc.Label itself. cc.LabelOutline and cc.LabelShadow still exist and still
+        // accept the writes — set-property lands, and reading the node back shows the new value —
+        // but they are deprecated proxies onto the label and carry no serialized state of their
+        // own, so the prefab comes out with the component present and every field missing. The
+        // readback cannot catch that: it is telling the truth about the live object, and the loss
+        // happens at serialization. Only reading the saved file shows it.
+        if (n.outline) {
+            const c = hexToColor(n.outline.color);
+            set('enableOutline', { type: 'Boolean', value: true });
+            if (c) set('outlineColor', { type: 'cc.Color', value: c });
+            set('outlineWidth', { type: 'Number', value: n.outline.width || 1 });
+        }
+        if (n.shadow) {
+            const c = hexToColor(n.shadow.color);
+            set('enableShadow', { type: 'Boolean', value: true });
+            if (c) set('shadowColor', { type: 'cc.Color', value: c });
+            // Figma's offset is y-down. The panel negates y for positions but not for this one,
+            // so the flip has to happen here or every shadow lands on the wrong side.
+            set('shadowOffset', { type: 'cc.Vec2', value: { x: n.shadow.offsetX || 0, y: -(n.shadow.offsetY || 0) } });
+            set('shadowBlur', { type: 'Number', value: n.shadow.blur || 0 });
+        }
+    }
+
+    // Figma auto-layout. type/spacing/padding map cleanly; primaryAlign and counterAlign do not —
+    // Cocos splits alignment across alignHorizontal/alignVertical booleans and separate direction
+    // enums, so they are left alone rather than guessed at.
+    if (n.layout && LAYOUT_TYPE[n.layout.type]) {
+        const horizontal = n.layout.type === 'HORIZONTAL';
+        components.push('cc.Layout');
+        props['__comps__.cc.Layout.type'] = { type: 'Enum', value: LAYOUT_TYPE[n.layout.type] };
+        props[`__comps__.cc.Layout.spacing${horizontal ? 'X' : 'Y'}`] = { type: 'Number', value: n.layout.spacing || 0 };
+        for (const side of ['Left', 'Right', 'Top', 'Bottom']) {
+            const v = n.layout[`padding${side}`];
+            if (v) props[`__comps__.cc.Layout.padding${side}`] = { type: 'Number', value: v };
+        }
     }
     // Opacity is a separate component in Cocos, and adding it unconditionally would put one on
     // every node in the tree for no reason.

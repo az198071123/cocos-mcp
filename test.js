@@ -54,6 +54,7 @@ let reimports = 0;
 // something to be right and wrong about.
 let knownTextures = new Set();
 let sentComponents = [];
+let sentProps = {};
 // Removing a node takes its descendants with it, and so does create-prefab replacing one.
 // A flat stub that dropped only the named node would let a leaked child pass unnoticed.
 const removeSubtree = (uuid) => {
@@ -194,6 +195,23 @@ global.Editor = {
                             verticalAlign: { type: 'Enum', value: 1 },
                             overflow: { type: 'Enum', value: 0 },
                             opacity: { type: 'Number', value: 255 },
+                            width: { type: 'Number', value: 2 },
+                            offset: { type: 'cc.Vec2', value: { x: 2, y: 2 } },
+                            blur: { type: 'Number', value: 2 },
+                            type: { type: 'Enum', value: 0 },
+                            spacingX: { type: 'Number', value: 0 },
+                            spacingY: { type: 'Number', value: 0 },
+                            paddingLeft: { type: 'Number', value: 0 },
+                            paddingRight: { type: 'Number', value: 0 },
+                            paddingTop: { type: 'Number', value: 0 },
+                            paddingBottom: { type: 'Number', value: 0 },
+                            enableOutline: { type: 'Boolean', value: false },
+                            outlineColor: { type: 'cc.Color', value: { r: 0, g: 0, b: 0, a: 255 } },
+                            outlineWidth: { type: 'Number', value: 2 },
+                            enableShadow: { type: 'Boolean', value: false },
+                            shadowColor: { type: 'cc.Color', value: { r: 0, g: 0, b: 0, a: 255 } },
+                            shadowOffset: { type: 'cc.Vec2', value: { x: 2, y: 2 } },
+                            shadowBlur: { type: 'Number', value: 2 },
                         };
                     }
                     return { type, value: n.compValues[type] };
@@ -202,6 +220,16 @@ global.Editor = {
             }
             if (pkg === 'scene' && method === 'snapshot') { snapshots += 1; return undefined; }
             if (pkg === 'scene' && method === 'set-property') {
+                // set_property resolves a type name to an index before it gets here, so record it
+                // back under the type — otherwise a test can only assert on a shifting number.
+                {
+                    const m = /^__comps__\.(\d+)\.(.+)$/.exec(args[0].path);
+                    const owner = sceneNodes.find((x) => x.uuid === args[0].uuid);
+                    const key = m && owner && owner.components[Number(m[1])]
+                        ? `__comps__.${owner.components[Number(m[1])]}.${m[2]}`
+                        : args[0].path;
+                    sentProps[key] = args[0].dump;
+                }
                 const { path, dump } = args[0];
                 // Deliberately returns true even when it writes nothing — that is the real
                 // editor's most dangerous behaviour, and the reason set_property reads back.
@@ -383,7 +411,10 @@ async function assertPortFree() {
                         type: 'Label', name: 'Title', size: { width: 64, height: 46 }, position: { x: 0, y: 0 },
                         string: '系统', fontSize: 32, lineHeight: 32, color: '#ff8000', isBold: true, isItalic: false,
                         horizontalAlign: 'LEFT', verticalAlign: 'CENTER', overflow: 'WIDTH_AND_HEIGHT',
+                        outline: { color: '#00ff00ff', width: 3 },
+                        shadow: { color: '#000000cc', offsetX: 2, offsetY: 4, blur: 5 },
                     }],
+                    layout: { type: 'VERTICAL', spacing: 12, paddingLeft: 8, paddingRight: 0, paddingTop: 0, paddingBottom: 6 },
                 }],
             },
         };
@@ -409,6 +440,23 @@ async function assertPortFree() {
         // mask comes from Figma's clipsContent. A Cocos node does not clip its children, so losing
         // it makes every oversized image draw in full and the cells overlap.
         assert.ok(sentComponents.includes('cc.Mask'), 'mask:true must become a cc.Mask component');
+        // Outline and shadow are components, not label fields, and Figma's shadow offset is y-down
+        // while Cocos is y-up — a shadow that lands above the text instead of below is the tell.
+        // cc.LabelOutline and cc.LabelShadow accept these writes and read them straight back, but
+        // they are deprecated proxies with no serialized state, so the prefab would save the
+        // component with every field missing. The values belong on cc.Label itself.
+        assert.ok(!sentComponents.includes('cc.LabelOutline'), 'the deprecated proxy must not be used');
+        assert.ok(!sentComponents.includes('cc.LabelShadow'), 'the deprecated proxy must not be used');
+        assert.ok(sentComponents.includes('cc.Layout'), 'auto-layout must become cc.Layout');
+        assert.equal(sentProps['__comps__.cc.Label.enableOutline'].value, true);
+        assert.equal(sentProps['__comps__.cc.Label.outlineWidth'].value, 3);
+        assert.deepEqual(sentProps['__comps__.cc.Label.outlineColor'].value, { r: 0, g: 255, b: 0, a: 255 });
+        assert.equal(sentProps['__comps__.cc.Label.enableShadow'].value, true);
+        assert.deepEqual(sentProps['__comps__.cc.Label.shadowOffset'].value, { x: 2, y: -4 }, 'the shadow offset must be flipped to y-up');
+        assert.equal(sentProps['__comps__.cc.Layout.type'].value, 2, 'VERTICAL');
+        assert.equal(sentProps['__comps__.cc.Layout.spacingY'].value, 12, 'vertical layout spaces on Y');
+        assert.equal(sentProps['__comps__.cc.Layout.paddingLeft'].value, 8);
+        assert.ok(!('__comps__.cc.Layout.paddingRight' in sentProps), 'a zero padding is not worth writing');
         assert.deepEqual(sceneNodes, [], 'the workbench must be empty afterwards');
 
         // allowMissingTextures still builds the layout, and still says which ones are blank.
