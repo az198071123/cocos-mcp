@@ -40,6 +40,21 @@ const PREFAB_UUID = 'P-PREFAB';
 let instantiateComponents = null;
 let sceneMode = 'general';
 let sceneDirty = true;
+// The scene stands in as a workbench for prefab_create: nodes go in, and a failed build
+// must leave it empty again.
+let sceneNodes = [];
+let createdPrefabUrl = null;
+// Removing a node takes its descendants with it, and so does create-prefab replacing one.
+// A flat stub that dropped only the named node would let a leaked child pass unnoticed.
+const removeSubtree = (uuid) => {
+    const doomed = new Set([uuid]);
+    let grew = true;
+    while (grew) {
+        grew = false;
+        for (const n of sceneNodes) if (!doomed.has(n.uuid) && doomed.has(n.parent)) { doomed.add(n.uuid); grew = true; }
+    }
+    sceneNodes = sceneNodes.filter((n) => !doomed.has(n.uuid));
+};
 let openSceneUuid = 'OTHER-SCENE';
 const resetPrefab = () => {
     const doc = [
@@ -94,6 +109,36 @@ global.Editor = {
                 }
                 return { echoed: args[0] };
             }
+            if (pkg === 'scene' && method === 'create-node') {
+                const uuid = `NEW-${sceneNodes.length}`;
+                sceneNodes.push({ uuid, name: args[0].name, parent: args[0].parent, components: [], prefab: null });
+                return uuid;
+            }
+            if (pkg === 'scene' && method === 'create-component') {
+                const n = sceneNodes.find((x) => x.uuid === args[0].uuid);
+                if (!n) throw new Error(`no such node ${args[0].uuid}`);
+                if (args[0].component === 'NoSuchClass') throw new Error('can not find class NoSuchClass');
+                n.components.push(args[0].component);
+                return undefined;
+            }
+            if (pkg === 'scene' && method === 'remove-node') {
+                removeSubtree(args[0].uuid);
+                return undefined;
+            }
+            if (pkg === 'scene' && method === 'create-prefab') {
+                // Mirrors the editor: the node handed in is destroyed and replaced by a fresh
+                // instance with a new uuid, renamed to the file's basename.
+                if (!sceneNodes.some((x) => x.uuid === args[0])) throw new Error('no such node');
+                const base = String(args[1]).split('/').pop().replace(/\.prefab$/, '');
+                removeSubtree(args[0]);
+                sceneNodes.push({ uuid: 'INSTANCE', name: base, components: [], prefab: { assetUuid: 'NEW-PREFAB' } });
+                createdPrefabUrl = args[1];
+                return 'NEW-PREFAB';
+            }
+            if (pkg === 'scene' && method === 'query-node-tree') {
+                return { uuid: 'ROOT', name: 'scene', children: sceneNodes.map((n) => ({ ...n, children: [] })) };
+            }
+            if (pkg === 'asset-db' && method === 'delete-asset') { createdPrefabUrl = null; return undefined; }
             if (pkg === 'scene' && method === 'query-dirty') return sceneDirty;
             if (pkg === 'scene' && method === 'query-scene-mode') return sceneMode;
             if (pkg === 'scene' && method === 'query-current-scene') return openSceneUuid;
@@ -102,7 +147,12 @@ global.Editor = {
                 fs.writeFileSync(PREFAB_FILE, args[1]);
                 return { url: PREFAB_URL, uuid: PREFAB_UUID, file: PREFAB_FILE, importer: 'prefab' };
             }
-            if (pkg === 'scene' && method === 'query-node') return args[0] === 'N1' ? sceneNode : null;
+            if (pkg === 'scene' && method === 'query-node') {
+                if (args[0] === 'N1') return sceneNode;
+                // Workbench nodes carry just enough of a dump for set_property to read back.
+                const n = sceneNodes.find((x) => x.uuid === args[0]);
+                return n ? (n.dump || (n.dump = { position: { type: 'cc.Vec3', value: { x: 0, y: 0, z: 0 } }, __comps__: [] })) : null;
+            }
             if (pkg === 'scene' && method === 'snapshot') { snapshots += 1; return undefined; }
             if (pkg === 'scene' && method === 'set-property') {
                 const { path, dump } = args[0];
@@ -144,6 +194,7 @@ global.Editor = {
             if (pkg === 'builder' && method === 'add-task') { addTaskArgs = args; return args[1] ? 36 : 1; }
             if (pkg === 'asset-db' && method === 'query-asset-info') {
                 const t = args[0];
+                if (t === createdPrefabUrl) return { url: t, uuid: 'NEW-PREFAB', file: path.join(tmp, 'New.prefab'), importer: 'prefab' };
                 if (t === PREFAB_URL || t === PREFAB_UUID) {
                     return { url: PREFAB_URL, uuid: PREFAB_UUID, file: PREFAB_FILE, importer: 'prefab', source: PREFAB_URL };
                 }
@@ -202,7 +253,7 @@ async function assertPortFree() {
     assert.equal(notif.status, 202, 'notification must get 202, no body');
 
     const list = await (await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).json();
-    assert.equal(list.result.tools.length, 14);
+    assert.equal(list.result.tools.length, 15);
 
     // set_property: the four outcomes, against a stub whose set-property always claims success
     {
@@ -266,6 +317,48 @@ async function assertPortFree() {
         assert.match(clean.note, /no unsaved changes/);
     }
 
+    // prefab_create: the scene is a workbench, and it has to be left empty either way
+    {
+        let id = 980;
+        const create = async (args) => {
+            const r = await (await post({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name: 'prefab_create', arguments: args } })).json();
+            return r.result.isError ? { isError: true, text: r.result.content[0].text } : JSON.parse(r.result.content[0].text);
+        };
+        sceneNodes = [];
+        createdPrefabUrl = null;
+        instantiateComponents = ['UITransform'];
+
+        const made = await create({
+            url: 'db://assets/gen/Panel.prefab',
+            tree: {
+                name: 'Root',
+                components: ['cc.UITransform'],
+                props: { 'position.x': { type: 'Number', value: 12 } },
+                children: [{ name: 'Label', components: ['cc.Label'] }],
+            },
+        });
+        assert.equal(made.uuid, 'NEW-PREFAB');
+        assert.equal(made.sceneNodeRemoved, true, 'the instance create-prefab leaves behind must be cleared');
+        assert.deepEqual(sceneNodes, [], 'the workbench must be empty when it succeeds');
+
+        const dupe = await create({ url: 'db://assets/gen/Panel.prefab', tree: { name: 'Root' } });
+        assert.match(dupe.text, /already exists/, 'must not silently overwrite an existing asset');
+
+        // Failure partway through: the nodes built so far must not be left in the user's scene.
+        sceneNodes = [];
+        createdPrefabUrl = null;
+        const failed = await create({
+            url: 'db://assets/gen/Other.prefab',
+            tree: { name: 'Root', children: [{ name: 'Broken', components: ['NoSuchClass'] }] },
+        });
+        assert.ok(failed.isError);
+        assert.match(failed.text, /NoSuchClass/);
+        assert.deepEqual(sceneNodes, [], 'a failed build must tear down every node it created');
+
+        const badUrl = await create({ url: '/tmp/x.prefab', tree: { name: 'Root' } });
+        assert.match(badUrl.text, /db:\/\/assets/);
+    }
+
     // prefab_add_component: append to the file, verify through the engine, roll back if it lies
     {
         let id = 960;
@@ -324,8 +417,10 @@ async function assertPortFree() {
         openSceneUuid = 'OTHER-SCENE';
     }
 
-    const req = await (await post({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'editor_request', arguments: { pkg: 'scene', method: 'query-node-tree' } } })).json();
-    assert.match(req.result.content[0].text, /query-node-tree/);
+    // An unstubbed message, so the stub echoes pkg/method back and this really checks that
+    // editor_request forwards them verbatim rather than that some stub happened to answer.
+    const req = await (await post({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'editor_request', arguments: { pkg: 'scene', method: 'query-anything' } } })).json();
+    assert.match(req.result.content[0].text, /query-anything/);
 
     const ev = await (await post({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'editor_eval', arguments: { code: 'return Editor.Project.path' } } })).json();
     assert.equal(ev.result.content[0].text, PROJECT);
@@ -539,7 +634,7 @@ async function assertPortFree() {
     ext.load();
     await new Promise((r) => setTimeout(r, 200));
     const again = await (await post({ jsonrpc: '2.0', id: 9, method: 'tools/list' })).json();
-    assert.equal(again.result.tools.length, 14, 'reload leaked the port');
+    assert.equal(again.result.tools.length, 15, 'reload leaked the port');
     ext.unload();
 
 
@@ -554,7 +649,7 @@ async function assertPortFree() {
         fresh.load();
         await new Promise((r) => setTimeout(r, 200));
         const viaEnv = await (await post({ jsonrpc: '2.0', id: 19, method: 'tools/list' })).json();
-        assert.equal(viaEnv.result.tools.length, 14, 'COCOS_MCP_PORT must outrank .port');
+        assert.equal(viaEnv.result.tools.length, 15, 'COCOS_MCP_PORT must outrank .port');
         fresh.unload();
     } finally {
         if (hadPort === null) fs.unlinkSync(portFile);

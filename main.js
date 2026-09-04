@@ -128,6 +128,30 @@ const TOOLS = [
         },
     },
     {
+        name: 'prefab_create',
+        description:
+            'Create a new prefab from a described node tree. Nodes are built in the open scene — create-prefab ' +
+            'only accepts a live node — then the leftover instance is removed, so the scene ends where it '  +
+            'started but marked dirty: undo or close without saving, never save it. The editor does the ' +
+            'serialization, so the file format is always right. Properties go through set_property, so a write ' +
+            'that does not land fails here instead of being baked into the asset, and the result is verified by ' +
+            'instantiating the finished prefab through the engine. Refuses if the url already exists. ' +
+            'To add a component to a prefab that already exists, use prefab_add_component instead — it never ' +
+            'opens or touches the scene.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                url: { type: 'string', description: 'db://assets/.../Name.prefab — the folder is created if missing' },
+                tree: {
+                    type: 'object',
+                    description: 'the root node: { name, components?: ["cc.UITransform","MyScript"], props?: {"__comps__.cc.UITransform.contentSize": {...}}, children?: [ ...same shape ] }. ' +
+                        'components take the ccclass name, not a uuid. Note the root node is renamed to the file basename.',
+                },
+            },
+            required: ['url', 'tree'],
+        },
+    },
+    {
         name: 'prefab_add_component',
         description:
             'Add a component to a prefab by editing the asset file, without ever opening it in the editor. ' +
@@ -553,6 +577,76 @@ async function callTool(name, a) {
                     : (contentChanged
                         ? `wrote ${file} — diff it now. An untouched prefab saves as a 0-line diff, so every changed line is something that was really written.`
                         : 'the file on disk is byte-identical to before; this save wrote nothing'),
+            };
+        }
+        case 'prefab_create': {
+            if (!a.url || !/^db:\/\/assets\//.test(a.url)) throw new Error('url must be a db://assets/... path ending in .prefab');
+            if (await request('asset-db', 'query-asset-info', a.url).catch(() => null)) {
+                throw new Error(`${a.url} already exists — delete it first, or pick another name`);
+            }
+            const dirtyBefore = await request('scene', 'query-dirty');
+            const created = [];   // scene nodes to tear down, deepest first
+            let assetUuid = null;
+            try {
+                // Nodes are built in the open scene because create-prefab only takes a live node.
+                // Nothing here is ever saved: the scene is a workbench, and step 5 clears it.
+                const build = async (spec, parent) => {
+                    if (!spec || !spec.name) throw new Error('every node needs a name');
+                    const uuid = await request('scene', 'create-node', parent ? { name: spec.name, parent } : { name: spec.name });
+                    created.unshift(uuid);
+                    for (const type of spec.components || []) {
+                        // component is the ccclass name, not a uuid — a script uses its class name.
+                        await request('scene', 'create-component', { uuid, component: type });
+                    }
+                    for (const [path, dump] of Object.entries(spec.props || {})) {
+                        // Through set_property so every write is read back; a silent miss here would
+                        // be baked into the asset and only noticed at runtime.
+                        const r = await callTool('set_property', { uuid, path, dump });
+                        if (r.pathMissing) throw new Error(`${spec.name}: nothing reads at ${path}, so it was not set`);
+                    }
+                    for (const child of spec.children || []) await build(child, uuid);
+                    return uuid;
+                };
+                const rootUuid = await build(a.tree, undefined);
+                assetUuid = await request('scene', 'create-prefab', rootUuid, a.url);
+                if (!assetUuid) throw new Error('create-prefab returned nothing; the asset was not written');
+            } catch (e) {
+                for (const uuid of created) await request('scene', 'remove-node', { uuid }).catch(() => {});
+                if (assetUuid) await request('asset-db', 'delete-asset', a.url).catch(() => {});
+                throw e;
+            }
+            // create-prefab destroys the node it was given and drops in a fresh instance with a new
+            // uuid, so the ids collected above are stale. Find the instance by the asset it points
+            // at rather than by name: the node is also renamed to the file's basename.
+            const flatten = (n, out = []) => { out.push(n); (n.children || []).forEach((c) => flatten(c, out)); return out; };
+            const instance = flatten(await request('scene', 'query-node-tree'))
+                .find((n) => n.prefab && n.prefab.assetUuid === assetUuid);
+            if (instance) await request('scene', 'remove-node', { uuid: instance.uuid }).catch(() => {});
+            const info = await request('asset-db', 'query-asset-info', a.url).catch(() => null);
+            let engineTree = null;
+            try {
+                engineTree = await callTool('scene_eval', {
+                    code: `const asset = await new Promise((res, rej) => cc.assetManager.loadAny([{ uuid: ${JSON.stringify(assetUuid)}, type: cc.Prefab }], (e, r) => e ? rej(e) : res(r)));
+                           const n = cc.instantiate(asset);
+                           const walk = (x) => ({ name: x.name, components: x.components.map((c) => c.constructor.name), children: x.children.map(walk) });
+                           const out = walk(n);
+                           n.destroy();
+                           return out;`,
+                });
+            } catch (e) {
+                engineTree = { error: String((e && e.message) || e) };
+            }
+            return {
+                asset: a.url,
+                uuid: assetUuid,
+                file: info && info.file,
+                // The engine's own view of what was written — the only check that catches a
+                // component whose script never resolved, which is otherwise completely silent.
+                engineTree,
+                sceneNodeRemoved: !!instance,
+                dirtyBefore: !!dirtyBefore,
+                note: 'the prefab and its .meta are on disk. The scene was used as a workbench and is now marked dirty even though its content is back where it started — undo or close without saving; do not save it.'
+                    + (dirtyBefore ? ' NOTE: the scene already had unsaved changes before this ran, so undo carefully.' : ''),
             };
         }
         case 'prefab_add_component': {
