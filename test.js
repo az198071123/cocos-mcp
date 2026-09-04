@@ -53,6 +53,7 @@ let reimports = 0;
 // Texture uuids this project is pretending to contain, so the missing-texture guard has
 // something to be right and wrong about.
 let knownTextures = new Set();
+let sentComponents = [];
 // Removing a node takes its descendants with it, and so does create-prefab replacing one.
 // A flat stub that dropped only the named node would let a leaked child pass unnoticed.
 const removeSubtree = (uuid) => {
@@ -129,6 +130,7 @@ global.Editor = {
                 if (!n) throw new Error(`no such node ${args[0].uuid}`);
                 if (args[0].component === 'NoSuchClass') throw new Error('can not find class NoSuchClass');
                 n.components.push(args[0].component);
+                sentComponents.push(args[0].component);
                 return undefined;
             }
             if (pkg === 'scene' && method === 'remove-node') {
@@ -375,7 +377,7 @@ async function assertPortFree() {
             root: {
                 type: 'Node', name: 'root', size: { width: 0, height: 0 }, position: { x: 0, y: 0 },
                 children: [{
-                    type: 'Sprite', name: 'Panel', size: { width: 300, height: 200 }, position: { x: 10, y: -20 },
+                    type: 'Sprite', name: 'Panel', size: { width: 300, height: 200 }, position: { x: 10, y: -20 }, mask: true,
                     textureName: 'TEX-A@f9941', opacity: 1, active: true,
                     children: [{
                         type: 'Label', name: 'Title', size: { width: 64, height: 46 }, position: { x: 0, y: 0 },
@@ -404,6 +406,9 @@ async function assertPortFree() {
         // The wrapper the panel emits is an empty node called "root"; keeping it would put a
         // zero-sized parent above the whole design.
         assert.equal(made.figmaNodes, 2, 'the "root" wrapper must be dropped, leaving Panel + Title');
+        // mask comes from Figma's clipsContent. A Cocos node does not clip its children, so losing
+        // it makes every oversized image draw in full and the cells overlap.
+        assert.ok(sentComponents.includes('cc.Mask'), 'mask:true must become a cc.Mask component');
         assert.deepEqual(sceneNodes, [], 'the workbench must be empty afterwards');
 
         // allowMissingTextures still builds the layout, and still says which ones are blank.

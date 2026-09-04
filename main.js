@@ -573,6 +573,11 @@ function figmaNodeToSpec(n) {
         props.scale = { type: 'cc.Vec3', value: { x: scale.x === undefined ? 1 : scale.x, y: scale.y === undefined ? 1 : scale.y, z: 1 } };
     }
     if (n.active === false) props.active = { type: 'Boolean', value: false };
+    // Figma's clipsContent. A Cocos node does not clip its children, so without this every image
+    // draws at its own full size and the cells overlap — which is exactly what a cropped avatar
+    // grid looks like when it comes out wrong. cc.Mask defaults to GRAPHICS_RECT, which masks to
+    // this node's UITransform rect, matching the Figma frame.
+    if (n.mask) components.push('cc.Mask');
 
     if (n.type === 'Sprite') {
         components.push('cc.Sprite');
