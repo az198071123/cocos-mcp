@@ -145,6 +145,7 @@ const TOOLS = [
                 data: { type: 'object', description: 'the parsed JSON instead of a path' },
                 unwrap: { type: 'boolean', description: 'drop the empty "root" wrapper node the panel emits (default true)' },
                 allowMissingTextures: { type: 'boolean', description: 'build anyway, with those sprites left blank' },
+                allowUnmapped: { type: 'boolean', description: 'build anyway when the design contains node types with no mapping (Graphics: vectors, ellipses, lines)' },
             },
             required: ['url'],
         },
@@ -549,7 +550,6 @@ function countComponents(tree) {
 const FIGMA_OVERFLOW = { WIDTH_AND_HEIGHT: 0, TRUNCATE: 1, NONE: 1, HEIGHT: 3 };
 const H_ALIGN = { LEFT: 0, CENTER: 1, RIGHT: 2, JUSTIFIED: 0 };
 const V_ALIGN = { TOP: 0, CENTER: 1, BOTTOM: 2 };
-const LAYOUT_TYPE = { HORIZONTAL: 1, VERTICAL: 2 };
 
 function hexToColor(hex) {
     const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})?$/i.exec(String(hex || ''));
@@ -562,13 +562,17 @@ function hexToColor(hex) {
 function figmaNodeToSpec(n) {
     const components = ['cc.UITransform'];
     const props = {};
-    const size = n.size || {};
-    if (size.width || size.height) {
-        props['__comps__.cc.UITransform.contentSize'] = { type: 'cc.Size', value: { width: size.width || 0, height: size.height || 0 } };
+    // Written even when it is 0x0: skipping leaves Cocos's default 100x100, which a mask would
+    // then clip to. The reference assigns unconditionally too.
+    if (n.size) {
+        props['__comps__.cc.UITransform.contentSize'] = { type: 'cc.Size', value: { width: n.size.width || 0, height: n.size.height || 0 } };
     }
     const pos = n.position || {};
     if (pos.x || pos.y) props.position = { type: 'cc.Vec3', value: { x: pos.x || 0, y: pos.y || 0, z: 0 } };
-    if (n.rotation) props.angle = { type: 'Number', value: -n.rotation };
+    // Straight through, matching the reference importer (scene.ts: `node.angle = nodeData.rotation`).
+    // I had negated this; the two implementations of the same format cannot both be right, and no
+    // design in hand actually uses rotation, so it follows the one the team already ships.
+    if (n.rotation) props.angle = { type: 'Number', value: n.rotation };
     const scale = n.scale || {};
     if ((scale.x !== undefined && scale.x !== 1) || (scale.y !== undefined && scale.y !== 1)) {
         props.scale = { type: 'cc.Vec3', value: { x: scale.x === undefined ? 1 : scale.x, y: scale.y === undefined ? 1 : scale.y, z: 1 } };
@@ -622,19 +626,12 @@ function figmaNodeToSpec(n) {
         }
     }
 
-    // Figma auto-layout. type/spacing/padding map cleanly; primaryAlign and counterAlign do not —
-    // Cocos splits alignment across alignHorizontal/alignVertical booleans and separate direction
-    // enums, so they are left alone rather than guessed at.
-    if (n.layout && LAYOUT_TYPE[n.layout.type]) {
-        const horizontal = n.layout.type === 'HORIZONTAL';
-        components.push('cc.Layout');
-        props['__comps__.cc.Layout.type'] = { type: 'Enum', value: LAYOUT_TYPE[n.layout.type] };
-        props[`__comps__.cc.Layout.spacing${horizontal ? 'X' : 'Y'}`] = { type: 'Number', value: n.layout.spacing || 0 };
-        for (const side of ['Left', 'Right', 'Top', 'Bottom']) {
-            const v = n.layout[`padding${side}`];
-            if (v) props[`__comps__.cc.Layout.padding${side}`] = { type: 'Number', value: v };
-        }
-    }
+    // Figma auto-layout is deliberately NOT turned into cc.Layout. The panel has already baked
+    // every child's absolute position from its absoluteBoundingBox, and cc.Layout runs in edit
+    // mode and rewrites those positions from its own spacing and padding. Measured: a child
+    // written at y=200 came back out of the file at y=275. The reference importer refuses for the
+    // same reason (figma-to-cocos scene.ts: "暫時不加 Cocos Layout component，保留 Figma 算好的
+    // 子節點絕對座標"). It is reported instead, so the information is dropped loudly, not quietly.
     // Opacity is a separate component in Cocos, and adding it unconditionally would put one on
     // every node in the tree for no reason.
     if (n.opacity !== undefined && n.opacity < 1) {
@@ -647,6 +644,21 @@ function figmaNodeToSpec(n) {
         props,
         children: (n.children || []).map(figmaNodeToSpec),
     };
+}
+
+const SUPPORTED_FIGMA_TYPES = ['Node', 'Sprite', 'Label'];
+
+// The panel emits type "Graphics" for VECTOR, BOOLEAN_OPERATION, STAR, ELLIPSE and LINE, and the
+// reference importer draws those through cc.Graphics. Falling through to a bare Node makes icons
+// and dividers disappear from a build that reports success — the same silent blank the missing
+// texture guard exists to stop, so it is surfaced the same way.
+function surveyUnmapped(n, acc = { unsupportedTypes: {}, autoLayoutNodes: [] }) {
+    if (!SUPPORTED_FIGMA_TYPES.includes(n.type)) {
+        acc.unsupportedTypes[n.type] = (acc.unsupportedTypes[n.type] || 0) + 1;
+    }
+    if (n.layout) acc.autoLayoutNodes.push(n.name);
+    (n.children || []).forEach((c) => surveyUnmapped(c, acc));
+    return acc;
 }
 
 function collectTextureUuids(n, out = []) {
@@ -753,6 +765,9 @@ async function callTool(name, a) {
             };
         }
         case 'prefab_from_figma': {
+            if (!a.data && !a.source) {
+                throw new Error('pass source (a path to figma-to-cocos.json, written to the project root by the panel) or data');
+            }
             const raw = a.data || JSON.parse(fs.readFileSync(a.source, 'utf8'));
             let root = raw.root || raw;
             // figma-to-cocos wraps the frame in an empty node literally called "root". Keeping it
@@ -776,11 +791,23 @@ async function callTool(name, a) {
                     + 'or pass allowMissingTextures to build the layout anyway.',
                 );
             }
+            const survey = surveyUnmapped(root);
+            const unsupported = Object.entries(survey.unsupportedTypes);
+            if (unsupported.length && !a.allowUnmapped) {
+                throw new Error(
+                    `${unsupported.map(([t, c]) => `${c} ${t}`).join(', ')} node(s) have no mapping, so they would build as empty containers `
+                    + '— vectors, ellipses and lines come through as "Graphics" and would simply not be drawn. '
+                    + 'Pass allowUnmapped to build the rest anyway.',
+                );
+            }
             const countNodes = (n) => 1 + (n.children || []).reduce((s, c) => s + countNodes(c), 0);
             const result = await callTool('prefab_create', { url: a.url, tree: figmaNodeToSpec(root) });
             return Object.assign(result, {
                 figmaNodes: countNodes(root),
                 textures: { total: new Set(textures).size, missing },
+                unsupportedTypes: unsupported.length ? survey.unsupportedTypes : undefined,
+                // Reported rather than applied: see figmaNodeToSpec on why cc.Layout is not added.
+                autoLayoutIgnored: survey.autoLayoutNodes.length ? survey.autoLayoutNodes : undefined,
             });
         }
         case 'prefab_create': {

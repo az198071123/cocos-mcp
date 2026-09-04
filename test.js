@@ -199,7 +199,6 @@ global.Editor = {
                             offset: { type: 'cc.Vec2', value: { x: 2, y: 2 } },
                             blur: { type: 'Number', value: 2 },
                             type: { type: 'Enum', value: 0 },
-                            spacingX: { type: 'Number', value: 0 },
                             spacingY: { type: 'Number', value: 0 },
                             paddingLeft: { type: 'Number', value: 0 },
                             paddingRight: { type: 'Number', value: 0 },
@@ -419,7 +418,10 @@ async function assertPortFree() {
             },
         };
 
+        // Reset with the rest: without this the assertions below pass on whatever an earlier
+        // block happened to send, and would still pass if this tool did nothing at all.
         sceneNodes = []; createdPrefabUrl = null; knownTextures = new Set();
+        sentComponents = []; sentProps = {};
         // A texture that is not in the project imports as nothing and the sprite renders blank
         // with no error, so it has to be caught before the prefab exists rather than after.
         const blocked = await fromFigma({ url: 'db://assets/gen/FromFigma.prefab', data: doc });
@@ -428,6 +430,7 @@ async function assertPortFree() {
         assert.deepEqual(sceneNodes, [], 'refusing must not leave the workbench dirty');
 
         knownTextures = new Set(['TEX-A@f9941']);
+        sentComponents = []; sentProps = {};
         instantiateComponents = () => ['UITransform', 'Sprite'];
         const made = await fromFigma({ url: 'db://assets/gen/FromFigma.prefab', data: doc });
         if (made.isError) throw new Error('prefab_from_figma failed: ' + made.text);
@@ -447,16 +450,31 @@ async function assertPortFree() {
         // component with every field missing. The values belong on cc.Label itself.
         assert.ok(!sentComponents.includes('cc.LabelOutline'), 'the deprecated proxy must not be used');
         assert.ok(!sentComponents.includes('cc.LabelShadow'), 'the deprecated proxy must not be used');
-        assert.ok(sentComponents.includes('cc.Layout'), 'auto-layout must become cc.Layout');
+        // cc.Layout runs in edit mode and rewrites its children's positions from its own spacing,
+        // throwing away the absolute coordinates the panel already baked in — measured: a child
+        // written at y=200 came back out of the file at y=275. It is reported, never applied.
+        assert.ok(!sentComponents.includes('cc.Layout'), 'cc.Layout would overwrite the imported positions');
+        assert.deepEqual(made.autoLayoutIgnored, ['Panel'], 'an ignored auto-layout must be named in the result');
         assert.equal(sentProps['__comps__.cc.Label.enableOutline'].value, true);
         assert.equal(sentProps['__comps__.cc.Label.outlineWidth'].value, 3);
         assert.deepEqual(sentProps['__comps__.cc.Label.outlineColor'].value, { r: 0, g: 255, b: 0, a: 255 });
         assert.equal(sentProps['__comps__.cc.Label.enableShadow'].value, true);
         assert.deepEqual(sentProps['__comps__.cc.Label.shadowOffset'].value, { x: 2, y: -4 }, 'the shadow offset must be flipped to y-up');
-        assert.equal(sentProps['__comps__.cc.Layout.type'].value, 2, 'VERTICAL');
-        assert.equal(sentProps['__comps__.cc.Layout.spacingY'].value, 12, 'vertical layout spaces on Y');
-        assert.equal(sentProps['__comps__.cc.Layout.paddingLeft'].value, 8);
-        assert.ok(!('__comps__.cc.Layout.paddingRight' in sentProps), 'a zero padding is not worth writing');
+        // A node type with no mapping builds as an empty container, which is the silent blank the
+        // texture guard exists to stop — so it is refused the same way.
+        sceneNodes = []; createdPrefabUrl = null; sentComponents = []; sentProps = {};
+        const vector = JSON.parse(JSON.stringify(doc));
+        vector.root.children[0].children.push({ type: 'Graphics', name: 'Divider', size: { width: 100, height: 2 }, position: { x: 0, y: 0 } });
+        const blockedVector = await fromFigma({ url: 'db://assets/gen/Vec.prefab', data: vector });
+        assert.ok(blockedVector.isError);
+        assert.match(blockedVector.text, /1 Graphics node\(s\) have no mapping/);
+        assert.deepEqual(sceneNodes, [], 'refusing must not leave the workbench dirty');
+
+        const forcedVector = await fromFigma({ url: 'db://assets/gen/Vec.prefab', data: vector, allowUnmapped: true });
+        assert.deepEqual(forcedVector.unsupportedTypes, { Graphics: 1 }, 'what was dropped has to be named');
+
+        const noSource = await fromFigma({ url: 'db://assets/gen/None.prefab' });
+        assert.match(noSource.text, /pass source .* or data/);
         assert.deepEqual(sceneNodes, [], 'the workbench must be empty afterwards');
 
         // allowMissingTextures still builds the layout, and still says which ones are blank.
