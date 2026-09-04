@@ -128,6 +128,28 @@ const TOOLS = [
         },
     },
     {
+        name: 'prefab_from_figma',
+        description:
+            'Turn the intermediate JSON the figma-to-cocos panel writes (<project>/figma-to-cocos.json, or ' +
+            'wherever configSavePath points) into a prefab. That file already carries the hard part — the ' +
+            'layout in Cocos coordinates and each sprite resolved to a spriteFrame sub-asset uuid — so this ' +
+            'maps Node/Sprite/Label onto components and hands the tree to prefab_create, which builds and ' +
+            'verifies it. Every texture uuid is checked against this project first: one that is missing imports ' +
+            'as nothing and the sprite renders blank with no error, so it refuses rather than producing that. ' +
+            'The panel itself is a GUI and cannot be driven from here, so someone has to run the conversion.',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                url: { type: 'string', description: 'db://assets/.../Name.prefab for the new prefab' },
+                source: { type: 'string', description: 'path to figma-to-cocos.json' },
+                data: { type: 'object', description: 'the parsed JSON instead of a path' },
+                unwrap: { type: 'boolean', description: 'drop the empty "root" wrapper node the panel emits (default true)' },
+                allowMissingTextures: { type: 'boolean', description: 'build anyway, with those sprites left blank' },
+            },
+            required: ['url'],
+        },
+    },
+    {
         name: 'prefab_create',
         description:
             'Create a new prefab from a described node tree. Nodes are built in the open scene — create-prefab ' +
@@ -522,6 +544,76 @@ function countComponents(tree) {
     return tree.components.length + (tree.children || []).reduce((n, c) => n + countComponents(c), 0);
 }
 
+// Figma's text autoresize does not line up one-to-one with cc.Label.Overflow; these are the
+// closest equivalents. Everything else is a straight enum index, read off the live dump.
+const FIGMA_OVERFLOW = { WIDTH_AND_HEIGHT: 0, TRUNCATE: 1, NONE: 1, HEIGHT: 3 };
+const H_ALIGN = { LEFT: 0, CENTER: 1, RIGHT: 2, JUSTIFIED: 0 };
+const V_ALIGN = { TOP: 0, CENTER: 1, BOTTOM: 2 };
+
+function hexToColor(hex) {
+    const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})?$/i.exec(String(hex || ''));
+    if (!m) return null;
+    return { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16), a: m[4] ? parseInt(m[4], 16) : 255 };
+}
+
+// figma-to-cocos writes an intermediate tree; this turns it into the shape prefab_create takes.
+// The coordinates are already Cocos-side (y up, relative to the parent), so they pass through.
+function figmaNodeToSpec(n) {
+    const components = ['cc.UITransform'];
+    const props = {};
+    const size = n.size || {};
+    if (size.width || size.height) {
+        props['__comps__.cc.UITransform.contentSize'] = { type: 'cc.Size', value: { width: size.width || 0, height: size.height || 0 } };
+    }
+    const pos = n.position || {};
+    if (pos.x || pos.y) props.position = { type: 'cc.Vec3', value: { x: pos.x || 0, y: pos.y || 0, z: 0 } };
+    if (n.rotation) props.angle = { type: 'Number', value: -n.rotation };
+    const scale = n.scale || {};
+    if ((scale.x !== undefined && scale.x !== 1) || (scale.y !== undefined && scale.y !== 1)) {
+        props.scale = { type: 'cc.Vec3', value: { x: scale.x === undefined ? 1 : scale.x, y: scale.y === undefined ? 1 : scale.y, z: 1 } };
+    }
+    if (n.active === false) props.active = { type: 'Boolean', value: false };
+
+    if (n.type === 'Sprite') {
+        components.push('cc.Sprite');
+        if (n.textureName) props['__comps__.cc.Sprite.spriteFrame'] = { type: 'cc.SpriteFrame', value: { uuid: n.textureName } };
+        // CUSTOM, or the sprite resizes itself to the source image and the size set above is lost.
+        props['__comps__.cc.Sprite.sizeMode'] = { type: 'Enum', value: 0 };
+    } else if (n.type === 'Label') {
+        components.push('cc.Label');
+        const set = (k, v) => { if (v !== undefined && v !== null) props[`__comps__.cc.Label.${k}`] = v; };
+        set('string', n.string === undefined ? undefined : { type: 'String', value: String(n.string) });
+        set('fontSize', n.fontSize === undefined ? undefined : { type: 'Number', value: n.fontSize });
+        set('lineHeight', n.lineHeight === undefined ? undefined : { type: 'Number', value: n.lineHeight });
+        const color = hexToColor(n.color);
+        set('color', color && { type: 'cc.Color', value: color });
+        if (n.isBold !== undefined) set('isBold', { type: 'Boolean', value: !!n.isBold });
+        if (n.isItalic !== undefined) set('isItalic', { type: 'Boolean', value: !!n.isItalic });
+        if (n.letterSpacing) set('spacingX', { type: 'Number', value: n.letterSpacing });
+        if (H_ALIGN[n.horizontalAlign] !== undefined) set('horizontalAlign', { type: 'Enum', value: H_ALIGN[n.horizontalAlign] });
+        if (V_ALIGN[n.verticalAlign] !== undefined) set('verticalAlign', { type: 'Enum', value: V_ALIGN[n.verticalAlign] });
+        if (FIGMA_OVERFLOW[n.overflow] !== undefined) set('overflow', { type: 'Enum', value: FIGMA_OVERFLOW[n.overflow] });
+    }
+    // Opacity is a separate component in Cocos, and adding it unconditionally would put one on
+    // every node in the tree for no reason.
+    if (n.opacity !== undefined && n.opacity < 1) {
+        components.push('cc.UIOpacity');
+        props['__comps__.cc.UIOpacity.opacity'] = { type: 'Number', value: Math.round(n.opacity * 255) };
+    }
+    return {
+        name: n.name || 'Node',
+        components,
+        props,
+        children: (n.children || []).map(figmaNodeToSpec),
+    };
+}
+
+function collectTextureUuids(n, out = []) {
+    if (n.textureName) out.push(n.textureName);
+    (n.children || []).forEach((c) => collectTextureUuids(c, out));
+    return out;
+}
+
 async function callTool(name, a) {
     switch (name) {
         case 'editor_request':
@@ -619,6 +711,37 @@ async function callTool(name, a) {
                         : 'the file on disk is byte-identical to before; this save wrote nothing'),
             };
         }
+        case 'prefab_from_figma': {
+            const raw = a.data || JSON.parse(fs.readFileSync(a.source, 'utf8'));
+            let root = raw.root || raw;
+            // figma-to-cocos wraps the frame in an empty node literally called "root". Keeping it
+            // would put a zero-sized parent above everything for no reason.
+            const wrapper = root.name === 'root' && (root.children || []).length === 1
+                && !(root.size && (root.size.width || root.size.height));
+            if (wrapper && a.unwrap !== false) root = root.children[0];
+
+            // A texture that is not in this project imports as nothing and the sprite silently
+            // renders blank, so check every uuid up front rather than after the prefab exists.
+            const textures = collectTextureUuids(root);
+            const missing = [];
+            for (const uuid of new Set(textures)) {
+                if (!await request('asset-db', 'query-asset-info', uuid).catch(() => null)) missing.push(uuid);
+            }
+            if (missing.length && !a.allowMissingTextures) {
+                throw new Error(
+                    `${missing.length} of ${new Set(textures).size} textures are not in this project, so those sprites would come out blank: `
+                    + `${missing.slice(0, 3).join(', ')}${missing.length > 3 ? ', ...' : ''}. `
+                    + 'Re-run the figma-to-cocos panel against this project so the images are downloaded here, '
+                    + 'or pass allowMissingTextures to build the layout anyway.',
+                );
+            }
+            const countNodes = (n) => 1 + (n.children || []).reduce((s, c) => s + countNodes(c), 0);
+            const result = await callTool('prefab_create', { url: a.url, tree: figmaNodeToSpec(root) });
+            return Object.assign(result, {
+                figmaNodes: countNodes(root),
+                textures: { total: new Set(textures).size, missing },
+            });
+        }
         case 'prefab_create': {
             // Both halves matter: without the suffix create-prefab writes an extension-less asset
             // that query-asset-info then cannot find, so the result reports a null file and the
@@ -636,6 +759,17 @@ async function callTool(name, a) {
                 if (!spec || !spec.name) throw new Error('every node needs a name');
                 const uuid = await request('scene', 'create-node', parent ? { name: spec.name, parent } : { name: spec.name });
                 created.unshift(uuid);
+                // create-node answers with a uuid the editor cannot always query yet. Measured over
+                // a 61-node tree: one run failed on a node the call had just returned, the next run
+                // built all 61. It is a burst-load flake, not a stale uuid, so wait for the node to
+                // actually appear instead of letting the first property write call it missing.
+                // ponytail: fixed 5 x 200ms; if a tree ever outruns that, back the whole build off
+                // rather than raising the ceiling.
+                for (let i = 0; i < 5; i += 1) {
+                    if (await request('scene', 'query-node', uuid).catch(() => null)) break;
+                    if (i === 4) throw new Error(`the editor never made ${spec.name} queryable after create-node returned ${uuid}`);
+                    await new Promise((r) => setTimeout(r, 200));
+                }
                 for (const type of spec.components || []) {
                     // component is the ccclass name, not a uuid — a script uses its class name.
                     await request('scene', 'create-component', { uuid, component: type });

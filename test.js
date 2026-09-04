@@ -50,6 +50,9 @@ let mangleOnSave = false;
 // Counted so a test can insist the asset is re-imported after a write: without that the
 // scene process keeps serving the version from before the save.
 let reimports = 0;
+// Texture uuids this project is pretending to contain, so the missing-texture guard has
+// something to be right and wrong about.
+let knownTextures = new Set();
 // Removing a node takes its descendants with it, and so does create-prefab replacing one.
 // A flat stub that dropped only the named node would let a leaked child pass unnoticed.
 const removeSubtree = (uuid) => {
@@ -164,9 +167,36 @@ global.Editor = {
             }
             if (pkg === 'scene' && method === 'query-node') {
                 if (args[0] === 'N1') return sceneNode;
-                // Workbench nodes carry just enough of a dump for set_property to read back.
+                // Workbench nodes carry just enough of a dump for set_property to read back — and
+                // __comps__ has to reflect what create-component added, or every component-scoped
+                // property path resolves against an empty list and is never exercised at all.
                 const n = sceneNodes.find((x) => x.uuid === args[0]);
-                return n ? (n.dump || (n.dump = { position: { type: 'cc.Vec3', value: { x: 0, y: 0, z: 0 } }, __comps__: [] })) : null;
+                if (!n) return null;
+                if (!n.dump) n.dump = { position: { type: 'cc.Vec3', value: { x: 0, y: 0, z: 0 } }, angle: { type: 'Number', value: 0 }, scale: { type: 'cc.Vec3', value: { x: 1, y: 1, z: 1 } }, active: { type: 'Boolean', value: true } };
+                n.dump.__comps__ = n.components.map((type) => {
+                    if (!n.compValues) n.compValues = {};
+                    // Only the fields the converter writes; anything else would be invented detail.
+                    if (!n.compValues[type]) {
+                        n.compValues[type] = {
+                            contentSize: { type: 'cc.Size', value: { width: 0, height: 0 } },
+                            spriteFrame: { type: 'cc.SpriteFrame', value: { uuid: '' } },
+                            sizeMode: { type: 'Enum', value: 1 },
+                            string: { type: 'String', value: '' },
+                            fontSize: { type: 'Number', value: 20 },
+                            lineHeight: { type: 'Number', value: 20 },
+                            color: { type: 'cc.Color', value: { r: 0, g: 0, b: 0, a: 255 } },
+                            isBold: { type: 'Boolean', value: false },
+                            isItalic: { type: 'Boolean', value: false },
+                            spacingX: { type: 'Number', value: 0 },
+                            horizontalAlign: { type: 'Enum', value: 1 },
+                            verticalAlign: { type: 'Enum', value: 1 },
+                            overflow: { type: 'Enum', value: 0 },
+                            opacity: { type: 'Number', value: 255 },
+                        };
+                    }
+                    return { type, value: n.compValues[type] };
+                });
+                return n.dump;
             }
             if (pkg === 'scene' && method === 'snapshot') { snapshots += 1; return undefined; }
             if (pkg === 'scene' && method === 'set-property') {
@@ -209,6 +239,7 @@ global.Editor = {
             if (pkg === 'builder' && method === 'add-task') { addTaskArgs = args; return args[1] ? 36 : 1; }
             if (pkg === 'asset-db' && method === 'query-asset-info') {
                 const t = args[0];
+                if (knownTextures.has(t)) return { url: 'db://assets/tex.png', uuid: t, importer: 'image' };
                 if (t === createdPrefabUrl) return { url: t, uuid: 'NEW-PREFAB', file: path.join(tmp, 'New.prefab'), importer: 'prefab' };
                 if (t === PREFAB_URL || t === PREFAB_UUID) {
                     return { url: PREFAB_URL, uuid: PREFAB_UUID, file: PREFAB_FILE, importer: 'prefab', source: PREFAB_URL };
@@ -268,7 +299,7 @@ async function assertPortFree() {
     assert.equal(notif.status, 202, 'notification must get 202, no body');
 
     const list = await (await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).json();
-    assert.equal(list.result.tools.length, 15);
+    assert.equal(list.result.tools.length, 16);
 
     // set_property: the four outcomes, against a stub whose set-property always claims success
     {
@@ -330,6 +361,55 @@ async function assertPortFree() {
         const clean = await save();
         assert.equal(clean.saved, false, 'a clean editor must not be saved again');
         assert.match(clean.note, /no unsaved changes/);
+    }
+
+
+    // prefab_from_figma: the panel's intermediate JSON, mapped onto components
+    {
+        let id = 990;
+        const fromFigma = async (args) => {
+            const r = await (await post({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name: 'prefab_from_figma', arguments: args } })).json();
+            return r.result.isError ? { isError: true, text: r.result.content[0].text } : JSON.parse(r.result.content[0].text);
+        };
+        const doc = {
+            root: {
+                type: 'Node', name: 'root', size: { width: 0, height: 0 }, position: { x: 0, y: 0 },
+                children: [{
+                    type: 'Sprite', name: 'Panel', size: { width: 300, height: 200 }, position: { x: 10, y: -20 },
+                    textureName: 'TEX-A@f9941', opacity: 1, active: true,
+                    children: [{
+                        type: 'Label', name: 'Title', size: { width: 64, height: 46 }, position: { x: 0, y: 0 },
+                        string: '系统', fontSize: 32, lineHeight: 32, color: '#ff8000', isBold: true, isItalic: false,
+                        horizontalAlign: 'LEFT', verticalAlign: 'CENTER', overflow: 'WIDTH_AND_HEIGHT',
+                    }],
+                }],
+            },
+        };
+
+        sceneNodes = []; createdPrefabUrl = null; knownTextures = new Set();
+        // A texture that is not in the project imports as nothing and the sprite renders blank
+        // with no error, so it has to be caught before the prefab exists rather than after.
+        const blocked = await fromFigma({ url: 'db://assets/gen/FromFigma.prefab', data: doc });
+        assert.ok(blocked.isError);
+        assert.match(blocked.text, /1 of 1 textures are not in this project/);
+        assert.deepEqual(sceneNodes, [], 'refusing must not leave the workbench dirty');
+
+        knownTextures = new Set(['TEX-A@f9941']);
+        instantiateComponents = () => ['UITransform', 'Sprite'];
+        const made = await fromFigma({ url: 'db://assets/gen/FromFigma.prefab', data: doc });
+        if (made.isError) throw new Error('prefab_from_figma failed: ' + made.text);
+        assert.equal(made.uuid, 'NEW-PREFAB');
+        assert.equal(made.textures.total, 1);
+        assert.deepEqual(made.textures.missing, []);
+        // The wrapper the panel emits is an empty node called "root"; keeping it would put a
+        // zero-sized parent above the whole design.
+        assert.equal(made.figmaNodes, 2, 'the "root" wrapper must be dropped, leaving Panel + Title');
+        assert.deepEqual(sceneNodes, [], 'the workbench must be empty afterwards');
+
+        // allowMissingTextures still builds the layout, and still says which ones are blank.
+        sceneNodes = []; createdPrefabUrl = null; knownTextures = new Set();
+        const forced = await fromFigma({ url: 'db://assets/gen/Forced.prefab', data: doc, allowMissingTextures: true });
+        assert.deepEqual(forced.textures.missing, ['TEX-A@f9941']);
     }
 
     // prefab_create: the scene is a workbench, and it has to be left empty either way
@@ -684,7 +764,7 @@ async function assertPortFree() {
     ext.load();
     await new Promise((r) => setTimeout(r, 200));
     const again = await (await post({ jsonrpc: '2.0', id: 9, method: 'tools/list' })).json();
-    assert.equal(again.result.tools.length, 15, 'reload leaked the port');
+    assert.equal(again.result.tools.length, 16, 'reload leaked the port');
     ext.unload();
 
 
@@ -699,7 +779,7 @@ async function assertPortFree() {
         fresh.load();
         await new Promise((r) => setTimeout(r, 200));
         const viaEnv = await (await post({ jsonrpc: '2.0', id: 19, method: 'tools/list' })).json();
-        assert.equal(viaEnv.result.tools.length, 15, 'COCOS_MCP_PORT must outrank .port');
+        assert.equal(viaEnv.result.tools.length, 16, 'COCOS_MCP_PORT must outrank .port');
         fresh.unload();
     } finally {
         if (hadPort === null) fs.unlinkSync(portFile);
