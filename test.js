@@ -44,6 +44,12 @@ let sceneDirty = true;
 // must leave it empty again.
 let sceneNodes = [];
 let createdPrefabUrl = null;
+// When on, save-asset drops an override on its way to disk — the only way to prove the
+// override count is read back from the file rather than from the doc we just built.
+let mangleOnSave = false;
+// Counted so a test can insist the asset is re-imported after a write: without that the
+// scene process keeps serving the version from before the save.
+let reimports = 0;
 // Removing a node takes its descendants with it, and so does create-prefab replacing one.
 // A flat stub that dropped only the named node would let a leaked child pass unnoticed.
 const removeSubtree = (uuid) => {
@@ -105,7 +111,8 @@ global.Editor = {
                 // to resolve is simply absent from this list, which is what the tool checks for.
                 if (String(inner[0]).includes('cc.instantiate')) {
                     if (instantiateComponents === 'THROW') throw new Error('Cannot read property of undefined');
-                    return { components: instantiateComponents, children: 0 };
+                    const list = typeof instantiateComponents === 'function' ? instantiateComponents() : instantiateComponents;
+                    return { name: 'Root', components: list, children: [] };
                 }
                 return { echoed: args[0] };
             }
@@ -143,8 +150,16 @@ global.Editor = {
             if (pkg === 'scene' && method === 'query-scene-mode') return sceneMode;
             if (pkg === 'scene' && method === 'query-current-scene') return openSceneUuid;
             if (pkg === 'scene' && method === 'save-scene') { sceneDirty = false; return 'saved'; }
+            if (pkg === 'asset-db' && method === 'reimport-asset') { reimports += 1; return undefined; }
             if (pkg === 'asset-db' && method === 'save-asset') {
-                fs.writeFileSync(PREFAB_FILE, args[1]);
+                let content = args[1];
+                if (mangleOnSave) {
+                    const doc = JSON.parse(content);
+                    const i = doc.findIndex((e) => e.__type__ === 'CCPropertyOverrideInfo');
+                    if (i >= 0) doc.splice(i, 1);
+                    content = JSON.stringify(doc, null, 2);
+                }
+                fs.writeFileSync(PREFAB_FILE, content);
                 return { url: PREFAB_URL, uuid: PREFAB_UUID, file: PREFAB_FILE, importer: 'prefab' };
             }
             if (pkg === 'scene' && method === 'query-node') {
@@ -368,6 +383,13 @@ async function assertPortFree() {
         };
         resetPrefab();
         const originalText = fs.readFileSync(PREFAB_FILE, 'utf8');
+        // The fake engine reads the file, like the real one does, so the before/after counts move
+        // on their own. A canned list would make the comparison test nothing.
+        const componentsFromFile = () => {
+            const doc = JSON.parse(fs.readFileSync(PREFAB_FILE, 'utf8'));
+            return doc[1]._components.map((r) => doc[r.__id__].__type__);
+        };
+        instantiateComponents = componentsFromFile;
 
         const ok = await add({ target: PREFAB_URL, type: 'a4f2d44d-f78f-4fcb-bc21-0dc0c1b7e2d8', props: { duration: 0.2, easing: 5 } });
         // The compressed form is what a prefab actually stores; this exact string was read out of
@@ -399,11 +421,39 @@ async function assertPortFree() {
         const dupe = await add({ target: PREFAB_URL, type: 'a4f2d44d-f78f-4fcb-bc21-0dc0c1b7e2d8' });
         assert.match(dupe.text, /already has/);
 
+        // A root that already carries a component the engine cannot build. Comparing against the
+        // JSON count made such a prefab permanently unrepairable: the engine list is short by one
+        // forever, so every write "failed" and was rolled back.
+        resetPrefab();
+        instantiateComponents = () => componentsFromFile().slice(1);
+        const withDeadScript = await add({ target: PREFAB_URL, type: 'cc.Sprite' });
+        assert.equal(withDeadScript.verified, true, 'a dead script already on the node must not block an unrelated add');
+        assert.equal(withDeadScript.componentsAfter, withDeadScript.componentsBefore + 1);
+        // Without a re-import the scene process keeps serving the version from before the save, so
+        // the "after" reading is the "before" one and a correct write looks like a failure.
+        assert.ok(reimports > 0, 'the asset must be re-imported between the write and the check');
+
+        // overridesAfter has to come from the file. Reading it back off the in-memory doc could
+        // only ever report zero loss, which is a number that agrees with itself, not a check.
+        resetPrefab();
+        instantiateComponents = componentsFromFile;
+        mangleOnSave = true;
+        const mangled = await add({ target: PREFAB_URL, type: 'cc.Sprite' });
+        mangleOnSave = false;
+        assert.equal(mangled.overridesLost, 1, 'an override lost during the save must show up');
+
+        const noSuffix = await (async () => {
+            const r = await (await post({ jsonrpc: '2.0', id: 977, method: 'tools/call', params: { name: 'prefab_create', arguments: { url: 'db://assets/gen/NoSuffix', tree: { name: 'R' } } } })).json();
+            return r.result.content[0].text;
+        })();
+        assert.match(noSuffix, /ending in \.prefab/, 'an extension-less url writes an asset nothing can find again');
+
+
         // The rollback path: the engine builds the prefab without the component, so the write is
         // a silent failure and the file must go back exactly as it was.
         resetPrefab();
         const before = fs.readFileSync(PREFAB_FILE, 'utf8');
-        instantiateComponents = ['UITransform'];      // the new component did not come back
+        instantiateComponents = () => ['UITransform'];   // the engine never reflects the write
         const bad = await add({ target: PREFAB_URL, type: 'cc.BlockInputEvents' });
         assert.ok(bad.isError, 'a component the engine cannot build must not be reported as added');
         assert.match(bad.text, /file was restored/);

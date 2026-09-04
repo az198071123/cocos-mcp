@@ -482,6 +482,46 @@ function countTypes(doc, type) {
     return doc.filter((e) => e && e.__type__ === type).length;
 }
 
+function countTypesInFile(file, type) {
+    try {
+        return countTypes(JSON.parse(fs.readFileSync(file, 'utf8')), type);
+    } catch (e) {
+        return null;
+    }
+}
+
+// Build the prefab through the engine and report what it actually made. This is the only witness
+// that a component's script resolved: one that fails to is simply absent, with nothing logged.
+async function instantiatePrefab(uuid) {
+    return await callTool('scene_eval', {
+        code: `const uuid = ${JSON.stringify(uuid)};
+               const asset = await new Promise((res, rej) => cc.assetManager.loadAny([{ uuid, type: cc.Prefab }], (e, r) => e ? rej(e) : res(r)));
+               const n = cc.instantiate(asset);
+               const walk = (x) => ({ name: x.name, components: x.components.map((c) => c.constructor.name), children: x.children.map(walk) });
+               const out = walk(n);
+               n.destroy();
+               return out;`,
+    });
+}
+
+// save-asset writes the file, but the scene process keeps serving the version it last imported:
+// measured on 3.8.8, a prefab already loaded once still built 3 components after a save that took
+// it to 4, and only reported 4 once the asset had been re-imported. Without this a second edit in
+// one session verifies against the copy from before the write — a correct write gets rolled back
+// and reported as a failure, and the inverse (a broken write passing against a good cached copy)
+// is worse. Dropping it from cc.assetManager instead does not help and breaks the next load.
+async function reimportAndSettle(uuid) {
+    await request('asset-db', 'reimport-asset', uuid).catch(() => {});
+    await new Promise((r) => setTimeout(r, 1500));
+}
+
+// Every component in the tree, not just the root's: a component added below the root has to be
+// countable too, or verification for those nodes degrades to "the prefab still loads".
+function countComponents(tree) {
+    if (!tree || !Array.isArray(tree.components)) return 0;
+    return tree.components.length + (tree.children || []).reduce((n, c) => n + countComponents(c), 0);
+}
+
 async function callTool(name, a) {
     switch (name) {
         case 'editor_request':
@@ -580,61 +620,61 @@ async function callTool(name, a) {
             };
         }
         case 'prefab_create': {
-            if (!a.url || !/^db:\/\/assets\//.test(a.url)) throw new Error('url must be a db://assets/... path ending in .prefab');
+            // Both halves matter: without the suffix create-prefab writes an extension-less asset
+            // that query-asset-info then cannot find, so the result reports a null file and the
+            // duplicate guard misses it next time.
+            if (!a.url || !/^db:\/\/assets\/.+\.prefab$/.test(a.url)) throw new Error('url must be a db://assets/... path ending in .prefab');
             if (await request('asset-db', 'query-asset-info', a.url).catch(() => null)) {
                 throw new Error(`${a.url} already exists — delete it first, or pick another name`);
             }
             const dirtyBefore = await request('scene', 'query-dirty');
             const created = [];   // scene nodes to tear down, deepest first
             let assetUuid = null;
+            // Nodes are built in the open scene because create-prefab only takes a live node.
+            // Nothing here is ever saved: the scene is a workbench, and it is cleared below.
+            const build = async (spec, parent) => {
+                if (!spec || !spec.name) throw new Error('every node needs a name');
+                const uuid = await request('scene', 'create-node', parent ? { name: spec.name, parent } : { name: spec.name });
+                created.unshift(uuid);
+                for (const type of spec.components || []) {
+                    // component is the ccclass name, not a uuid — a script uses its class name.
+                    await request('scene', 'create-component', { uuid, component: type });
+                }
+                for (const [path, dump] of Object.entries(spec.props || {})) {
+                    // Through set_property so every write is read back; a silent miss here would
+                    // be baked into the asset and only noticed at runtime.
+                    const r = await callTool('set_property', { uuid, path, dump });
+                    if (r.pathMissing) throw new Error(`${spec.name}: nothing reads at ${path}, so it was not set`);
+                }
+                for (const child of spec.children || []) await build(child, uuid);
+                return uuid;
+            };
+            let instance = null;
+            let info = null;
+            let engineTree = null;
             try {
-                // Nodes are built in the open scene because create-prefab only takes a live node.
-                // Nothing here is ever saved: the scene is a workbench, and step 5 clears it.
-                const build = async (spec, parent) => {
-                    if (!spec || !spec.name) throw new Error('every node needs a name');
-                    const uuid = await request('scene', 'create-node', parent ? { name: spec.name, parent } : { name: spec.name });
-                    created.unshift(uuid);
-                    for (const type of spec.components || []) {
-                        // component is the ccclass name, not a uuid — a script uses its class name.
-                        await request('scene', 'create-component', { uuid, component: type });
-                    }
-                    for (const [path, dump] of Object.entries(spec.props || {})) {
-                        // Through set_property so every write is read back; a silent miss here would
-                        // be baked into the asset and only noticed at runtime.
-                        const r = await callTool('set_property', { uuid, path, dump });
-                        if (r.pathMissing) throw new Error(`${spec.name}: nothing reads at ${path}, so it was not set`);
-                    }
-                    for (const child of spec.children || []) await build(child, uuid);
-                    return uuid;
-                };
                 const rootUuid = await build(a.tree, undefined);
                 assetUuid = await request('scene', 'create-prefab', rootUuid, a.url);
                 if (!assetUuid) throw new Error('create-prefab returned nothing; the asset was not written');
+                // create-prefab destroys the node it was given and drops in a fresh instance with a
+                // new uuid, so the ids collected above are stale. Find the instance by the asset it
+                // points at, not by name: the node is also renamed to the file's basename.
+                const flatten = (n, out = []) => { out.push(n); (n.children || []).forEach((c) => flatten(c, out)); return out; };
+                instance = flatten(await request('scene', 'query-node-tree'))
+                    .find((n) => n.prefab && n.prefab.assetUuid === assetUuid) || null;
+                if (instance) {
+                    await request('scene', 'remove-node', { uuid: instance.uuid });
+                    created.length = 0;   // the subtree went with it
+                }
+                info = await request('asset-db', 'query-asset-info', a.url).catch(() => null);
+                engineTree = await instantiatePrefab(assetUuid);
             } catch (e) {
+                // Everything after create-prefab is in here too: a throw from the tree query or the
+                // verification used to leave both the asset and a stray instance behind, silently.
                 for (const uuid of created) await request('scene', 'remove-node', { uuid }).catch(() => {});
+                if (instance) await request('scene', 'remove-node', { uuid: instance.uuid }).catch(() => {});
                 if (assetUuid) await request('asset-db', 'delete-asset', a.url).catch(() => {});
                 throw e;
-            }
-            // create-prefab destroys the node it was given and drops in a fresh instance with a new
-            // uuid, so the ids collected above are stale. Find the instance by the asset it points
-            // at rather than by name: the node is also renamed to the file's basename.
-            const flatten = (n, out = []) => { out.push(n); (n.children || []).forEach((c) => flatten(c, out)); return out; };
-            const instance = flatten(await request('scene', 'query-node-tree'))
-                .find((n) => n.prefab && n.prefab.assetUuid === assetUuid);
-            if (instance) await request('scene', 'remove-node', { uuid: instance.uuid }).catch(() => {});
-            const info = await request('asset-db', 'query-asset-info', a.url).catch(() => null);
-            let engineTree = null;
-            try {
-                engineTree = await callTool('scene_eval', {
-                    code: `const asset = await new Promise((res, rej) => cc.assetManager.loadAny([{ uuid: ${JSON.stringify(assetUuid)}, type: cc.Prefab }], (e, r) => e ? rej(e) : res(r)));
-                           const n = cc.instantiate(asset);
-                           const walk = (x) => ({ name: x.name, components: x.components.map((c) => c.constructor.name), children: x.children.map(walk) });
-                           const out = walk(n);
-                           n.destroy();
-                           return out;`,
-                });
-            } catch (e) {
-                engineTree = { error: String((e && e.message) || e) };
             }
             return {
                 asset: a.url,
@@ -670,11 +710,19 @@ async function callTool(name, a) {
             const existing = (node._components || []).map((r) => (doc[r.__id__] || {}).__type__);
             if (existing.includes(type)) throw new Error(`${node._name} already has ${a.type} (${type})`);
 
+            // Counted from the file on disk, before and after. Counting the in-memory doc on both
+            // sides can only ever report zero loss — two pushes cannot remove an override — so it
+            // would be a number that always agrees with itself instead of a check.
             const beforeCounts = {
                 CCPropertyOverrideInfo: countTypes(doc, 'CCPropertyOverrideInfo'),
                 'cc.TargetInfo': countTypes(doc, 'cc.TargetInfo'),
                 entries: doc.length,
             };
+            // The engine's view before the write, so the check is "one more component than there
+            // was" rather than "as many as the JSON claims". A root already carrying a component
+            // with a dead script uuid is short by one in every engine list, and comparing against
+            // the JSON count would make such a prefab permanently unrepairable.
+            const treeBefore = await instantiatePrefab(info.uuid).catch(() => null);
             const used = new Set(doc.filter((e) => e && e.fileId).map((e) => e.fileId));
             let fileId = randomFileId();
             while (used.has(fileId)) fileId = randomFileId();
@@ -694,36 +742,37 @@ async function callTool(name, a) {
             // Matching it byte for byte is what keeps the diff to the lines actually added; any
             // other formatting reflows the whole file and buries the change.
             await request('asset-db', 'save-asset', info.url, JSON.stringify(doc, null, 2));
+            await reimportAndSettle(info.uuid);
 
-            const expected = node._components.length;
-            let verified = null;
-            let components = null;
+            let treeAfter = null;
             let failure = null;
             try {
-                // The engine's own deserializer is the only witness that matters: a component whose
-                // script fails to resolve simply does not appear, with nothing logged.
-                const out = await callTool('scene_eval', {
-                    code: `const asset = await new Promise((res, rej) => cc.assetManager.loadAny([{ uuid: ${JSON.stringify(info.uuid)}, type: cc.Prefab }], (e, r) => e ? rej(e) : res(r)));
-                           const n = cc.instantiate(asset);
-                           const out = { components: n.components.map((c) => c.constructor.name), children: n.children.length };
-                           n.destroy();
-                           return out;`,
-                });
-                components = out && out.components;
-                verified = nodeId === 1 ? Array.isArray(components) && components.length === expected : Array.isArray(components);
+                treeAfter = await instantiatePrefab(info.uuid);
             } catch (e) {
                 failure = String((e && e.message) || e);
             }
+            // Counting the whole tree, so a component added below the root is checked as strictly
+            // as one on it. Without a usable "before" the count means nothing, so that counts as
+            // unverified rather than as a pass.
+            const before = treeBefore ? countComponents(treeBefore) : null;
+            const after = treeAfter ? countComponents(treeAfter) : null;
+            const verified = before !== null && after === before + 1;
             if (!verified) {
                 await request('asset-db', 'save-asset', info.url, original);
+                await reimportAndSettle(info.uuid);
                 throw new Error(
-                    `the prefab did not come back with the component, so the file was restored. ${failure || `expected ${expected} components on the root, the engine built ${components ? components.length : 'none'}: ${JSON.stringify(components)}`}`,
+                    'the prefab did not come back with the component, so the file was restored. '
+                    + (failure || (before === null
+                        ? 'the prefab could not be built before the write, so there is nothing to compare against'
+                        : `the engine built ${after} components across the tree, up from ${before}; one more was expected`)),
                 );
             }
+            // Re-read from disk: this is the only place a reformat or an editor-side re-import
+            // could have dropped entries, and the in-memory doc would never show it.
             const afterCounts = {
-                CCPropertyOverrideInfo: countTypes(doc, 'CCPropertyOverrideInfo'),
-                'cc.TargetInfo': countTypes(doc, 'cc.TargetInfo'),
-                entries: doc.length,
+                CCPropertyOverrideInfo: countTypesInFile(info.file, 'CCPropertyOverrideInfo'),
+                'cc.TargetInfo': countTypesInFile(info.file, 'cc.TargetInfo'),
+                entries: (() => { try { return JSON.parse(fs.readFileSync(info.file, 'utf8')).length; } catch (e) { return null; } })(),
             };
             return {
                 asset: info.url,
@@ -733,11 +782,12 @@ async function callTool(name, a) {
                 typeFrom: type === a.type ? undefined : a.type,
                 fileId,
                 verified: true,
-                rootComponents: nodeId === 1 ? components : undefined,
-                verifiedScope: nodeId === 1 ? 'root component list' : 'prefab deserializes; per-node check only covers the root',
+                componentsBefore: before,
+                componentsAfter: after,
+                engineTree: treeAfter,
                 overridesBefore: beforeCounts,
                 overridesAfter: afterCounts,
-                overridesLost: beforeCounts.CCPropertyOverrideInfo - afterCounts.CCPropertyOverrideInfo,
+                overridesLost: afterCounts.CCPropertyOverrideInfo === null ? null : beforeCounts.CCPropertyOverrideInfo - afterCounts.CCPropertyOverrideInfo,
                 note: 'written straight to the file and re-imported; the prefab was never opened, so no nested instances were resynced. git diff it — the change should be about 35 lines with no deletions.',
             };
         }
