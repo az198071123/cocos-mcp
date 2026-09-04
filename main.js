@@ -74,6 +74,25 @@ const TOOLS = [
         },
     },
     {
+        name: 'set_property',
+        description:
+            'Write one property and read it straight back, so "it worked" is a measurement rather than a claim. ' +
+            'scene set-property reports success for writes that never land — a stale uuid, a mistyped path, a ' +
+            'component index that moved — so prefer this over calling it through editor_request. Returns the ' +
+            'value actually in the editor afterwards plus three outcomes: changed (it moved), noop (it was ' +
+            'already that value), pathMissing (nothing reads at that path, so nothing was written). ' +
+            'path takes a component type instead of an index: "__comps__.cc.Widget.right".',
+        inputSchema: {
+            type: 'object',
+            properties: {
+                uuid: { type: 'string', description: 'node uuid, from query-node-tree' },
+                path: { type: 'string', description: 'e.g. "position.x", "__comps__.2.enabled", "__comps__.cc.Widget.right"' },
+                dump: { type: 'object', description: 'the value wrapper, e.g. {"type":"Boolean","value":false}' },
+            },
+            required: ['uuid', 'path', 'dump'],
+        },
+    },
+    {
         name: 'build',
         description:
             'Start a Cocos build. With no options it reuses the settings of the last build task (falling back to ' +
@@ -302,6 +321,47 @@ const LOG_SOURCES = {
     'asset-db': (tmp) => newestFileIn(path.join(tmp, 'asset-db/log')),
 };
 
+// A dump node wraps its payload as { value, type }, and nesting alternates between the two.
+// Walk both shapes so callers write the path they see in the inspector ("position.x"),
+// not the serialization ("position.value.x").
+function readByPath(dump, path) {
+    let cur = dump;
+    for (const key of path.split('.')) {
+        if (cur === null || typeof cur !== 'object') return undefined;
+        if (!(key in cur) && cur.value && typeof cur.value === 'object') cur = cur.value;
+        if (cur === null || typeof cur !== 'object' || !(key in cur)) return undefined;
+        cur = cur[key];
+    }
+    // Report the value, not the wrapper: a wrapper carries editor-side metadata that is
+    // noise in a before/after diff.
+    return cur && typeof cur === 'object' && 'value' in cur ? cur.value : cur;
+}
+
+// Allow __comps__.cc.Widget.right instead of __comps__.3.right. Getting the index means
+// querying the node first, and an index that shifts (a component added or removed) writes
+// to the wrong component with no error at all.
+function resolveComponentPath(dump, path) {
+    const PREFIX = '__comps__.';
+    if (!path.startsWith(PREFIX)) return { path };
+    const rest = path.slice(PREFIX.length);
+    if (/^\d+\./.test(rest)) return { path };
+    const types = ((dump && dump.__comps__) || []).map((c) => c.type || c.cid);
+    // Component types are namespaced ("cc.Widget"), so the type/property boundary is not the
+    // first dot — match against the types actually on this node, longest first so that a type
+    // which is a prefix of another does not win.
+    const type = types.filter(Boolean).sort((x, y) => y.length - x.length).find((t) => rest.startsWith(t + '.'));
+    if (!type) {
+        throw new Error(`cannot resolve "${rest}" to a component on this node — it has: ${types.join(', ') || '(none)'}`);
+    }
+    const prop = rest.slice(type.length + 1);
+    const hits = [];
+    types.forEach((t, i) => { if (t === type) hits.push(i); });
+    if (hits.length > 1) {
+        throw new Error(`${hits.length} components of type ${type} on this node; use an explicit index: ${hits.map((i) => `${PREFIX}${i}.${prop}`).join(' | ')}`);
+    }
+    return { path: `${PREFIX}${hits[0]}.${prop}`, resolvedFrom: path };
+}
+
 async function callTool(name, a) {
     switch (name) {
         case 'editor_request':
@@ -335,6 +395,38 @@ async function callTool(name, a) {
                 );
             }
             return out;
+        }
+        case 'set_property': {
+            const beforeDump = await Editor.Message.request('scene', 'query-node', a.uuid);
+            // A stale uuid (every one in a prefab goes stale when it reloads) returns nothing
+            // here, and set-property on it is a silent no-op. Fail before writing instead.
+            if (!beforeDump) throw new Error(`no such node: ${a.uuid} — uuids go stale when a prefab reloads; re-query the tree`);
+            const { path, resolvedFrom } = resolveComponentPath(beforeDump, a.path);
+            const before = readByPath(beforeDump, path);
+            const returned = await Editor.Message.request('scene', 'set-property', { uuid: a.uuid, path, dump: a.dump });
+            const after = readByPath(await Editor.Message.request('scene', 'query-node', a.uuid), path);
+            const changed = JSON.stringify(before) !== JSON.stringify(after);
+            // Not writing and writing-the-same-value are both "unchanged" but mean opposite
+            // things: only one of them needs fixing. Split them on whether the path reads at all.
+            const pathMissing = before === undefined && after === undefined;
+            // Snapshot only on a real change: it is also what marks the scene dirty, so an
+            // unconditional one leaves a * in the title for a write that did nothing.
+            if (changed) await Editor.Message.request('scene', 'snapshot');
+            return {
+                path,
+                resolvedFrom,
+                before,
+                after,
+                changed,
+                noop: !changed && !pathMissing,
+                pathMissing,
+                setPropertyReturned: returned,
+                note: changed
+                    ? 'editor memory only — not saved. Widget/sizeMode on the same node, and instance overrides in any outer prefab, can still win at runtime.'
+                    : (pathMissing
+                        ? `nothing reads at ${path}, so nothing was written — check the path with editor_request scene query-node ${a.uuid}`
+                        : 'the value was already this; nothing changed and the scene was not marked dirty'),
+            };
         }
         case 'build': {
             const options = await buildOptions(a.overrides);

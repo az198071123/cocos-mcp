@@ -31,6 +31,24 @@ require('module')._load = ((orig) => function (req, ...rest) {
     }
     return orig.call(this, req, ...rest);
 })(require('module')._load);
+// A live node the set-property stub actually mutates. A stub that echoed the request back
+// would let a set_property that never writes anything pass every assertion below.
+let sceneNode = null;
+let snapshots = 0;
+const resetSceneNode = () => {
+    snapshots = 0;
+    sceneNode = {
+        position: { type: 'cc.Vec3', value: { x: 0, y: 0, z: 0 } },
+        __comps__: [
+            { type: 'cc.UITransform', value: { contentSize: { type: 'cc.Size', value: { width: 100, height: 50 } } } },
+            { type: 'cc.Widget', value: { right: { type: 'Number', value: 10 } } },
+            { type: 'MyComp', value: { speed: { type: 'Number', value: 1 } } },
+            { type: 'MyComp', value: { speed: { type: 'Number', value: 2 } } },
+        ],
+    };
+};
+resetSceneNode();
+
 global.Editor = {
     Project: { path: PROJECT, tmpDir: tmp, name: 'test-project', uuid: 'u1' },
     Package: { getPackages: () => [], disable: (p) => pkgCalls.push(['disable', p]), enable: (p) => pkgCalls.push(['enable', p]) },
@@ -43,6 +61,26 @@ global.Editor = {
                 if (inner[0] === 'CIRCULAR') throw new Error('Converting circular structure to JSON');
                 if (inner[0] === 'NORETURN') return undefined;
                 return { echoed: args[0] };
+            }
+            if (pkg === 'scene' && method === 'query-node') return args[0] === 'N1' ? sceneNode : null;
+            if (pkg === 'scene' && method === 'snapshot') { snapshots += 1; return undefined; }
+            if (pkg === 'scene' && method === 'set-property') {
+                const { path, dump } = args[0];
+                // Deliberately returns true even when it writes nothing — that is the real
+                // editor's most dangerous behaviour, and the reason set_property reads back.
+                const parts = path.split('.');
+                let cur = sceneNode;
+                for (const k of parts.slice(0, -1)) {
+                    if (cur && !(k in cur) && cur.value) cur = cur.value;
+                    if (!cur || !(k in cur)) return true;
+                    cur = cur[k];
+                }
+                const last = parts[parts.length - 1];
+                if (cur && !(last in cur) && cur.value) cur = cur.value;
+                if (!cur || !(last in cur)) return true;
+                if (cur[last] && typeof cur[last] === 'object' && 'value' in cur[last]) cur[last].value = dump.value;
+                else cur[last] = dump.value;
+                return true;
             }
             if (pkg === 'builder' && method === 'query-tasks-info') {
                 return {
@@ -120,7 +158,50 @@ async function assertPortFree() {
     assert.equal(notif.status, 202, 'notification must get 202, no body');
 
     const list = await (await post({ jsonrpc: '2.0', id: 2, method: 'tools/list' })).json();
-    assert.equal(list.result.tools.length, 11);
+    assert.equal(list.result.tools.length, 12);
+
+    // set_property: the four outcomes, against a stub whose set-property always claims success
+    {
+        let id = 900;
+        const set = async (args) => {
+            const r = await (await post({ jsonrpc: '2.0', id: id++, method: 'tools/call', params: { name: 'set_property', arguments: args } })).json();
+            return r.result.isError ? { isError: true, text: r.result.content[0].text } : JSON.parse(r.result.content[0].text);
+        };
+        resetSceneNode();
+
+        const moved = await set({ uuid: 'N1', path: 'position.x', dump: { type: 'Number', value: 42 } });
+        assert.equal(moved.changed, true);
+        assert.equal(moved.before, 0);
+        assert.equal(moved.after, 42);
+        assert.equal(snapshots, 1, 'a real change must snapshot, which is what marks the scene dirty');
+
+        const again = await set({ uuid: 'N1', path: 'position.x', dump: { type: 'Number', value: 42 } });
+        assert.equal(again.noop, true, 'writing the value it already has is a noop, not a change');
+        assert.equal(again.changed, false);
+        assert.equal(snapshots, 1, 'a noop must not snapshot — that would dirty the scene for nothing');
+
+        // The whole point: set-property returned true and nothing was written.
+        const bad = await set({ uuid: 'N1', path: '__comps__.1.nosuchprop', dump: { type: 'Number', value: 1 } });
+        assert.equal(bad.setPropertyReturned, true, 'the stub lies, like the editor does');
+        assert.equal(bad.pathMissing, true, 'the readback must catch what the return value hid');
+        assert.equal(bad.changed, false);
+        assert.equal(snapshots, 1);
+
+        // component type instead of index
+        const byType = await set({ uuid: 'N1', path: '__comps__.cc.Widget.right', dump: { type: 'Number', value: 7 } });
+        assert.equal(byType.path, '__comps__.1.right');
+        assert.equal(byType.resolvedFrom, '__comps__.cc.Widget.right');
+        assert.equal(byType.after, 7);
+
+        const dupe = await set({ uuid: 'N1', path: '__comps__.MyComp.speed', dump: { type: 'Number', value: 9 } });
+        assert.match(dupe.text, /2 components of type MyComp.*__comps__\.2\.speed/s, 'duplicate types must list the indexes, not guess');
+
+        const absent = await set({ uuid: 'N1', path: '__comps__.cc.Sprite.enabled', dump: { type: 'Boolean', value: false } });
+        assert.match(absent.text, /cannot resolve "cc\.Sprite\.enabled".*cc\.UITransform/s);
+
+        const stale = await set({ uuid: 'GONE', path: 'position.x', dump: { type: 'Number', value: 1 } });
+        assert.match(stale.text, /no such node: GONE/);
+    }
 
     const req = await (await post({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'editor_request', arguments: { pkg: 'scene', method: 'query-node-tree' } } })).json();
     assert.match(req.result.content[0].text, /query-node-tree/);
@@ -337,7 +418,7 @@ async function assertPortFree() {
     ext.load();
     await new Promise((r) => setTimeout(r, 200));
     const again = await (await post({ jsonrpc: '2.0', id: 9, method: 'tools/list' })).json();
-    assert.equal(again.result.tools.length, 11, 'reload leaked the port');
+    assert.equal(again.result.tools.length, 12, 'reload leaked the port');
     ext.unload();
 
 
@@ -352,7 +433,7 @@ async function assertPortFree() {
         fresh.load();
         await new Promise((r) => setTimeout(r, 200));
         const viaEnv = await (await post({ jsonrpc: '2.0', id: 19, method: 'tools/list' })).json();
-        assert.equal(viaEnv.result.tools.length, 11, 'COCOS_MCP_PORT must outrank .port');
+        assert.equal(viaEnv.result.tools.length, 12, 'COCOS_MCP_PORT must outrank .port');
         fresh.unload();
     } finally {
         if (hadPort === null) fs.unlinkSync(portFile);
